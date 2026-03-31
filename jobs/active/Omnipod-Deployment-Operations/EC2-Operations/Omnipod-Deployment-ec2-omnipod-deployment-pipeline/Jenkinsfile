@@ -1,0 +1,116 @@
+// Build the remote configuration using the UI-supplied parameters
+def remote = [:]
+remote.name = "ec2-instance"
+// Optionally, you can adjust the host using parameters or additional logic if needed
+remote.host = "10.246.213.155"  // Replace with your EC2 instance's IP address or DNS
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+    stages {
+        stage('Prepare SSH Connection') {
+            steps {
+                script {
+                    try {
+                        echo "Starting SSH connection preparation..."
+                        remote.allowAnyHosts = true
+                        remote.user = params.EC2_USER
+                        remote.identityFile = "/var/jenkins_home/${params.EC2_USER}"
+                        
+                        echo "Remote configuration:"
+                        echo "  User: ${remote.user}"
+                        echo "  Host: ${remote.host}"
+                        echo "  IdentityFile: ${remote.identityFile}"
+                        
+                        // Test the SSH connection
+                        def testOutput = sshCommand remote: remote, command: 'echo "Connected successfully to user: $(whoami)"'
+                        echo "SSH test output: ${testOutput}"
+                    } catch (Exception e) {
+                        echo "Error during SSH connection preparation: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error "Aborting pipeline due to SSH connection preparation error."
+                    }
+                }
+            }
+        }
+        stage('Run Remote Script with Assume-Role') {
+            steps {
+                script {
+                    try {
+                        // Determine the full path and command for the selected script
+                        def workdir = params.ENVIRONMENT
+                        def scriptDir = ""
+                        def scriptFullPath = ""
+                        def scriptCommand = ""
+                        
+                        if (params.SCRIPT_NAME == 'setup-new-deployment') {
+                            scriptFullPath = "/home/${params.EC2_USER}/deploy/tools/setup-new-deployment-new.sh"
+                            scriptDir = "/home/${params.EC2_USER}/deploy/tools/"
+                            scriptCommand = "cd ${scriptDir} && bash ${scriptFullPath} ${workdir} ${params.VERSION} ${params.EMAIL}"
+                        } else if (params.SCRIPT_NAME == 'prepare') {
+                            scriptFullPath = "/home/${params.EC2_USER}/deploy/prepare.sh"
+                            scriptDir = "/home/${params.EC2_USER}/deploy/"
+                            scriptCommand = "cd ${scriptDir} && bash ${scriptFullPath} ${workdir}"
+                        } else if (params.SCRIPT_NAME == 'pre-deploy-report') {
+                            scriptFullPath = "/home/${params.EC2_USER}/deploy/pre-deploy-report-new.sh"
+                            scriptDir = "/home/${params.EC2_USER}/deploy/"
+                            scriptCommand = "cd ${scriptDir} && bash ${scriptFullPath} ${workdir}"
+                        } else if (params.SCRIPT_NAME == 'run-deploy') {
+                            scriptFullPath = "/home/${params.EC2_USER}/deploy/run-deploy.sh"
+                            scriptDir = "/home/${params.EC2_USER}/deploy/"
+                            scriptCommand = "cd ${scriptDir} && bash ${scriptFullPath} ${workdir} log"
+                        } else if (params.SCRIPT_NAME == 'update-golive') {
+                            scriptFullPath = "/home/${params.EC2_USER}/deploy/tools/update-golive.sh"
+                            scriptDir = "/home/${params.EC2_USER}/deploy/tools/"
+                            scriptCommand = "cd ${scriptDir} && bash ${scriptFullPath} /home/${params.EC2_USER}/deploy/${workdir}"
+                        } else {
+                            error "Invalid SCRIPT_NAME provided: ${params.SCRIPT_NAME}"
+                        }
+
+                        // Get AWS account ID from Jenkins (runs on the Jenkins agent) and get the role name from Jenkins parameters.
+                        def accountId = sh(script: "aws sts get-caller-identity --query 'Account' --output text", returnStdout: true).trim()
+                        def roleName = params.ROLE_NAME  // Ensure this parameter is defined in Jenkins
+                        def roleArn = "arn:aws:iam::${accountId}:role/${roleName}"
+                        echo "Using role ARN: ${roleArn}"
+
+                        // Build the assume-role commands to run on the remote host
+                        def assumeRoleCmd = """\
+TEMP_ACCESS_ACCOUNT=\$(aws sts assume-role --role-arn ${roleArn} --role-session-name example)
+export AWS_ACCESS_KEY_ID=\$(echo \$TEMP_ACCESS_ACCOUNT | jq -r '.Credentials.AccessKeyId')
+export AWS_SECRET_ACCESS_KEY=\$(echo \$TEMP_ACCESS_ACCOUNT | jq -r '.Credentials.SecretAccessKey')
+export AWS_SESSION_TOKEN=\$(echo \$TEMP_ACCESS_ACCOUNT | jq -r '.Credentials.SessionToken')
+echo "Assumed cross-account role on remote host."
+"""
+                        // Concatenate the assume-role commands with the script command
+                        def fullCommand = assumeRoleCmd + "\n" + scriptCommand
+                        
+                        echo "Executing on remote host ${remote.host}:"
+                        echo fullCommand
+                        
+                        def scriptOutput = sshCommand remote: remote, command: fullCommand
+                        echo "Remote script output: ${scriptOutput}"
+                        
+                    } catch (Exception e) {
+                        echo "Error executing remote script: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error "Aborting pipeline due to remote script execution error."
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo "Pipeline completed."
+        }
+        success {
+            echo "Pipeline succeeded."
+        }
+        failure {
+            echo "Pipeline failed. Please review the logs for details."
+        }
+    }
+}

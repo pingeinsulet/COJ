@@ -1,0 +1,318 @@
+import groovy.json.JsonSlurper
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+    
+    environment {
+        ECS_CLUSTER_NAME = "${env.CLUSTER}"
+        type = "AOSS0003"
+        API_URL = "http://jenkins.dev.webserver.insulet.com/approval/create_approval_job.php"
+    }
+
+    stages {
+        stage('Capture Service Parameters') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|DEV|TEST|Test|INT|PERF|DEV2|STAGING|ATMTEST|)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data)
+                    def awsRegion = retList[0]
+                    
+                    echo "=========================================="
+                    echo "CAPTURING ECS SERVICE PARAMETERS"
+                    echo "=========================================="
+                    echo "Environment: ${env.ENVIRONMENT}"
+                    echo "AWS Profile: ${awsProfile}"
+                    echo "AWS Region: ${awsRegion}"
+                    echo "Cluster Name: ${env.CLUSTER.replaceAll(',', '')}"
+                    echo "=========================================="
+                    echo ""
+                    
+                    // Get list of services
+                    def serviceNames = sh(
+                        script: "aws --profile ${awsProfile} --region ${awsRegion} ecs list-services --cluster ${env.CLUSTER.replaceAll(',', '')} --output text --query 'serviceArns[*]' | tr '\\t' '\\n' | awk -F'/' '{print \$NF}'",
+                        returnStdout: true
+                    ).trim().split('\n')
+                    
+                    if (!serviceNames || serviceNames.size() == 0 || serviceNames[0] == '') {
+                        echo "No services found in cluster: ${env.CLUSTER.replaceAll(',', '')}"
+                        error("No services found in cluster")
+                    }
+                    
+                    echo "Found ${serviceNames.size()} service(s) in cluster"
+                    echo ""
+                    
+                    // Store service data in a map
+                    def servicesData = [:]
+                    
+                    for (def serviceName in serviceNames) {
+                        if (!serviceName || serviceName.trim() == '') continue
+                        
+                        echo "Capturing: ${serviceName}"
+                        
+                        // Get service parameters
+                        def desiredCount = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} ecs describe-services --cluster ${env.CLUSTER.replaceAll(',', '')} --services ${serviceName} --query 'services[0].desiredCount' --output text",
+                            returnStdout: true
+                        ).trim()
+                        
+                        def runningCount = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} ecs describe-services --cluster ${env.CLUSTER.replaceAll(',', '')} --services ${serviceName} --query 'services[0].runningCount' --output text",
+                            returnStdout: true
+                        ).trim()
+                        
+                        def taskDefinition = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} ecs describe-services --cluster ${env.CLUSTER.replaceAll(',', '')} --services ${serviceName} --query 'services[0].taskDefinition' --output text",
+                            returnStdout: true
+                        ).trim()
+                        
+                        def launchType = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} ecs describe-services --cluster ${env.CLUSTER.replaceAll(',', '')} --services ${serviceName} --query 'services[0].launchType' --output text 2>/dev/null || echo 'NONE'",
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Check for Auto Scaling
+                        def scalingInfo = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} application-autoscaling describe-scalable-targets --service-namespace ecs --resource-id service/${env.CLUSTER.replaceAll(',', '')}/${serviceName} --query 'ScalableTargets[0].[MinCapacity,MaxCapacity,RoleARN]' --output text 2>/dev/null || echo 'NONE'",
+                            returnStdout: true
+                        ).trim()
+                        
+                        def minCapacity = '0'
+                        def maxCapacity = '0'
+                        def roleArn = ''
+                        def hasAutoScaling = 'false'
+                        
+                        if (scalingInfo != 'NONE' && scalingInfo != '' && scalingInfo != 'None') {
+                            def scalingParts = scalingInfo.split('\t')
+                            if (scalingParts.size() >= 3) {
+                                minCapacity = scalingParts[0]
+                                maxCapacity = scalingParts[1]
+                                roleArn = scalingParts[2]
+                                hasAutoScaling = 'true'
+                            }
+                        }
+                        
+                        // Store service data
+                        servicesData[serviceName] = [
+                            desiredCount: desiredCount,
+                            runningCount: runningCount,
+                            taskDefinition: taskDefinition,
+                            launchType: launchType,
+                            hasAutoScaling: hasAutoScaling,
+                            minCapacity: minCapacity,
+                            maxCapacity: maxCapacity,
+                            roleArn: roleArn
+                        ]
+                        
+                        echo "  desired=${desiredCount}, running=${runningCount}, autoScaling=${hasAutoScaling}"
+                    }
+                    
+                    // Store in environment for next stages
+                    env.AWS_PROFILE = awsProfile
+                    env.AWS_REGION = awsRegion
+                    env.TOTAL_SERVICES = servicesData.size().toString()
+                    
+                    // Store service names list for iteration
+                    env.SERVICE_NAMES = serviceNames.findAll { it && it.trim() != '' }.join(',')
+                    
+                    // Store each service's data in environment variables
+                    servicesData.each { serviceName, serviceData ->
+                        env."${serviceName}_DESIRED_COUNT" = serviceData.desiredCount
+                        env."${serviceName}_RUNNING_COUNT" = serviceData.runningCount
+                        env."${serviceName}_TASK_DEFINITION" = serviceData.taskDefinition
+                        env."${serviceName}_LAUNCH_TYPE" = serviceData.launchType
+                        env."${serviceName}_HAS_AUTOSCALING" = serviceData.hasAutoScaling
+                        env."${serviceName}_MIN_CAPACITY" = serviceData.minCapacity
+                        env."${serviceName}_MAX_CAPACITY" = serviceData.maxCapacity
+                        env."${serviceName}_ROLE_ARN" = serviceData.roleArn
+                    }
+                    
+                    echo ""
+                    echo "✓ Parameter capture complete"
+                    echo "Total services: ${servicesData.size()}"
+                    echo "=========================================="
+                }
+            }
+        }
+        
+        stage('Generate Temp File') {
+            steps {
+                script {
+                    env.REQFILE = sh(script: "mktemp /tmp/agreq.XXXXXX.txt", returnStdout: true).trim()
+                    echo "Generated temp file: ${env.REQFILE}"
+                }
+            }
+        }
+
+        stage('Prepare Request File') {
+            steps {
+                script {
+                    def fullName = "${BUILD_USER}"
+                    echo "Build started by: ${fullName}"
+
+                    def timestamp = sh(script: "date '+%Y-%m-%d %H:%M:%S %Z'", returnStdout: true).trim()
+                    def reqLines = []
+                    reqLines.add("# === Job Parameters Below ===")
+                    reqLines.add("AGuserid=\"${fullName}\"")
+                    reqLines.add("ENVIRONMENT=${env.ENVIRONMENT}")
+                    reqLines.add("CLUSTER_NAME=${env.CLUSTER.replaceAll(',', '')}")
+                    reqLines.add("AWS_PROFILE=${env.AWS_PROFILE}")
+                    reqLines.add("AWS_REGION=${env.AWS_REGION}")
+                    reqLines.add("TOTAL_SERVICES=${env.TOTAL_SERVICES}")
+                    reqLines.add("SERVICE_NAMES=${env.SERVICE_NAMES}")
+                    reqLines.add("CAPTURE_TIMESTAMP=${timestamp}")
+                    reqLines.add("")
+                    reqLines.add("# === Service Parameters Below ===")
+                    
+                    // Add parameters for each service
+                    def serviceNames = env.SERVICE_NAMES.split(',')
+                    for (def serviceName in serviceNames) {
+                        if (!serviceName || serviceName.trim() == '') continue
+                        
+                        reqLines.add("")
+                        reqLines.add("# SERVICE: ${serviceName}")
+                        reqLines.add("${serviceName}_DESIRED_COUNT=${env."${serviceName}_DESIRED_COUNT"}")
+                        reqLines.add("${serviceName}_RUNNING_COUNT=${env."${serviceName}_RUNNING_COUNT"}")
+                        reqLines.add("${serviceName}_TASK_DEFINITION=${env."${serviceName}_TASK_DEFINITION"}")
+                        reqLines.add("${serviceName}_LAUNCH_TYPE=${env."${serviceName}_LAUNCH_TYPE"}")
+                        reqLines.add("${serviceName}_HAS_AUTOSCALING=${env."${serviceName}_HAS_AUTOSCALING"}")
+                        
+                        if (env."${serviceName}_HAS_AUTOSCALING" == 'true') {
+                            reqLines.add("${serviceName}_MIN_CAPACITY=${env."${serviceName}_MIN_CAPACITY"}")
+                            reqLines.add("${serviceName}_MAX_CAPACITY=${env."${serviceName}_MAX_CAPACITY"}")
+                            reqLines.add("${serviceName}_ROLE_ARN=${env."${serviceName}_ROLE_ARN"}")
+                        }
+                    }
+                    
+                    def content = reqLines.join('\n') + '\n'
+
+                    writeFile file: env.REQFILE, text: content
+                    echo "Request file content written to ${env.REQFILE}"
+                    echo "Total lines: ${reqLines.size()}"
+                    echo "\nFirst 30 lines:"
+                    echo reqLines.take(30).join('\n')
+                }
+            }
+        }
+
+        stage('Upload Parameters via Curl') {
+            steps {
+                script {
+                    def curlCommand = """
+                    curl -v -k -F "type=${env.type}" -F "jobfile=@${env.REQFILE}" ${env.API_URL}
+                    """
+                    def response = sh(script: curlCommand, returnStdout: true).trim()
+                    echo "Curl response:\n${response}"
+
+                    if (response ==~ /^\s*$/) {
+                        error("API returned blank output. Check server logs and input file formatting.")
+                    }
+                    
+                    // Extract job ID from response (typically just the number)
+                    def jobId = response.trim()
+                    env.APPROVAL_JOB_ID = jobId
+                    
+                    echo ""
+                    echo "✓ Parameters uploaded to approval gate"
+                    echo "Response: ${response}"
+                    echo "Job ID: ${env.APPROVAL_JOB_ID}"
+                }
+            }
+        }
+
+        stage('Send Email Notification') {
+            when {
+                expression { env.APPROVAL_JOB_ID && env.APPROVAL_JOB_ID != '' }
+            }
+            steps {
+                script {
+                    // Get user email - BUILD_USER is typically the username
+                    // Append domain if needed, or use BUILD_USER_EMAIL if available
+                    def userEmail = env.BUILD_USER_EMAIL ?: "${BUILD_USER}@insulet.com"
+                    def clusterName = env.CLUSTER.replaceAll(',', '')
+                    
+                    sh """
+                        rm -rf deploymenttemplatelibrary clouddeployment
+
+                        git clone https://bitbucket.insulet.com/scm/cldops/clouddeployment.git
+                        git clone https://bitbucket.insulet.com/scm/cldops/deploymenttemplatelibrary.git
+
+                        cd deploymenttemplatelibrary
+                        git checkout develop
+
+                        cd ../clouddeployment/deploy-cloud
+                        git checkout develop
+
+                        mv templates templates-org
+                        ln -s ../../deploymenttemplatelibrary/templates .
+
+                        export RELEASE_TEMPLATES=../../deploymenttemplatelibrary
+                        export AWS_PROFILE=WAADS3ACCESS
+
+                        echo " <br><br> ECS services have been shut down successfully. <br>" > ../../mailfile.txt
+                        echo " <br> Environment: ${env.ENVIRONMENT} <br>" >> ../../mailfile.txt
+                        echo " <br> Cluster: ${clusterName} <br>" >> ../../mailfile.txt
+                        echo " <br> Total Services: ${env.TOTAL_SERVICES} <br>" >> ../../mailfile.txt
+                        echo " <br><br> To start the services back up, use the following Job ID in the startup pipeline: <br>" >> ../../mailfile.txt
+                        echo " <br> <b>Job ID: ${env.APPROVAL_JOB_ID}</b> <br>" >> ../../mailfile.txt
+                        echo " <br><br> You can run the startup pipeline with the Job ID parameter set to: ${env.APPROVAL_JOB_ID} <br>" >> ../../mailfile.txt
+                        echo " <br> Or let it automatically find the next pending job. <br>" >> ../../mailfile.txt
+                        echo " <br><br> This is an automated message from Jenkins. <br>" >> ../../mailfile.txt
+                        echo " <br> Build: ${env.JOB_NAME} #${env.BUILD_NUMBER} <br>" >> ../../mailfile.txt
+
+                        cat ../../mailfile.txt
+
+                        echo "#!/bin/bash" > ../../email.sh
+                        echo "source lib/emaillib.sh" >> ../../email.sh
+                        echo "send_html_email \"EmailSender-NoReply@omnipodapps.com\" \"${userEmail}\" \"ECS Shutdown Complete - ${env.ENVIRONMENT}\" ../../mailfile.txt" >> ../../email.sh
+
+                        chmod +x ../../email.sh
+                        ../../email.sh
+                    """
+                    
+                    echo "✓ Email notification sent to ${userEmail}"
+                }
+            }
+        }
+
+        stage('Shutdown ECS Services') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|DEV|TEST|Test|INT|PERF|DEV2|STAGING|ATMTEST|)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data)
+                    def awsRegion = retList[0]
+                    
+                    echo "${awsProfile}"
+                    def services = sh(script: "aws --profile ${awsProfile} --region ${awsRegion} ecs list-services --cluster ${env.CLUSTER.replaceAll(',', '')} | jq -r '.serviceArns[]' | xargs -n 1 aws --profile ${awsProfile} --region ${awsRegion} ecs update-service --cluster ${env.CLUSTER.replaceAll(',', '')} --desired-count 0 --service", returnStdout: true).trim()
+                    echo "Updated the desired count to 0 for the following ECS services:"
+                    echo "${services}"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (env.REQFILE) {
+                    sh "rm -f ${env.REQFILE}"
+                    echo "Temp file ${env.REQFILE} removed."
+                }
+            }
+        }
+        
+        success {
+            echo "ECS services in ${CLUSTER} have been shut down successfully."
+            echo "ASG parameters have been uploaded to the API."
+        }
+
+        failure {
+            echo "Failed to shut down ECS services in ${CLUSTER}. Check the logs for details."
+        }
+    }
+}

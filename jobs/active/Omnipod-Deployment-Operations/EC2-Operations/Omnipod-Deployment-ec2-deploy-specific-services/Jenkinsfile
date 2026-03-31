@@ -1,0 +1,85 @@
+// Build the remote configuration using the UI-supplied parameters
+def remote = [:]
+remote.name = "ec2-instance"
+// Optionally, you can adjust the host using parameters or additional logic if needed
+remote.host = "10.246.213.155"  // Replace with your EC2 instance's IP address or DNS
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+    stages {
+        stage('Prepare SSH Connection') {
+            steps {
+                script {
+                    try {
+                        echo "Starting SSH connection preparation..."
+                        remote.allowAnyHosts = true
+                        remote.user = params.EC2_USER
+                        remote.identityFile = "/var/jenkins_home/${params.EC2_USER}"
+                        
+                        echo "Remote configuration:"
+                        echo "  User: ${remote.user}"
+                        echo "  Host: ${remote.host}"
+                        echo "  IdentityFile: ${remote.identityFile}"
+                        
+                        // Test the SSH connection using runscript
+                        def testOutput = sshCommand remote: remote, command: 'echo "Connected successfully to user: $(whoami)"'
+                        echo "SSH test output: ${testOutput}"
+                        
+                    } catch (Exception e) {
+                        echo "Error during SSH connection preparation: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error "Aborting pipeline due to SSH connection preparation error."
+                    }
+                }
+            }
+        }
+        stage('Run Ansible Playbook') {
+            steps {
+                script {
+                    try {
+                        // Split the comma-separated SERVICES_NAMES into a list
+                        def servicesList = params.SERVICE_NAMES.split(',')
+                        def envParts = params.ENVIRONMENT.split('-')
+                        def envPrefix = envParts[0]
+                        // Build the directory name using the ENVIRONAMENT parameter (e.g. "EU_RDHorizonQACloud-QA")
+                        def playbookDir = "/home/${remote.user}/deploy/${params.ENVIRONMENT}"
+                        
+                        // Loop through each service name to construct and execute the ansible-playbook command
+                        for (service in servicesList) {
+                            service = service.replaceAll('"', '').trim()
+                            // Construct the playbook file name (e.g. "playbook-EU_RDHorizonQACloud-compatibility.yml")
+                            def playbookFile = "playbook-${envPrefix}-${service}.yml"
+                            // Build the full command: change to the directory then run the playbook
+                            def command = "ansible-playbook ${playbookDir}/${playbookFile}"
+                            echo "Executing Ansible playbook for service '${service}': ${command}"
+                            
+                            // Execute the command on the remote EC2 instance via SSH
+                            def playbookOutput = sshCommand remote: remote, command: command
+                            echo "Playbook output for service '${service}': ${playbookOutput}"
+                        }
+                        
+                    } catch (Exception e) {
+                        echo "Error during Ansible playbook execution: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error "Aborting pipeline due to Ansible playbook execution error."
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo "Pipeline completed."
+        }
+        success {
+            echo "Pipeline succeeded."
+        }
+        failure {
+            echo "Pipeline failed. Please review the logs for details."
+        }
+    }
+}

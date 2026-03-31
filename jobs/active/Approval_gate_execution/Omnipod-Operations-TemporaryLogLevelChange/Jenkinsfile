@@ -1,0 +1,150 @@
+import groovy.json.JsonSlurper
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+
+    environment {
+        PHOME = "${WORKSPACE}"
+        PARMFILE = "${WORKSPACE}/parm.json"
+        REVERTFILE = "${WORKSPACE}/revert.json"
+    }
+
+    stages {
+        stage('Check Approval Status') {
+            steps {
+                script {
+                    def jobType = "OOTL0001"
+                    def apiUrl = "https://jenkins.nonprod.webserver.insulet.com/approval/get_next_job.php?type=${jobType}"
+                    def jobNumberRaw = sh(
+                        script: "curl -s -k '${apiUrl}' | sed '/^\\s*\$/d'",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "API response (filtered): '${jobNumberRaw}'"
+
+                    if (!jobNumberRaw) {
+                        error "No job available for type ${jobType}. Skipping execution."
+
+                    }
+
+                    def jobNumber = jobNumberRaw.toInteger()
+                    echo "Valid job number received: ${jobNumber}"
+
+                    env.JOB_ID = jobNumber.toString()
+                }
+            }
+        }
+
+        stage('Fetch Parameters from Job File') {
+            steps {
+                script {
+                    def jobFilePath = sh(script: "mktemp", returnStdout: true).trim()
+                    def fetchUrl = "https://jenkins.nonprod.webserver.insulet.com/approval/fetch_job_file.php?jobid=${env.JOB_ID}"
+
+                    echo "📄 Fetching jobfile from ${fetchUrl}"
+                    echo "📄 Temp job file path: ${jobFilePath}"
+
+                    sh """
+                        curl -sk '${fetchUrl}' -o '${jobFilePath}'
+                    """
+
+                    def lines = readFile(jobFilePath).readLines()
+                    for (line in lines) {
+                        line = line.trim()
+                        if (line.startsWith("#") || line.isEmpty()) continue
+                        def (key, value) = line.tokenize("=")
+                        key = key?.trim()?.toUpperCase()
+                        value = value?.trim()?.replaceAll(/^"|"$/, '')
+                        if (key && value) {
+                            echo "Setting env: ${key}=${value}"
+                            env."${key}" = value
+                        }
+                    }
+
+                    sh "rm -f '${jobFilePath}'"
+                }
+            }
+        }  
+        stage('Get Existing Parameters') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + env.ENVIRONMENT).getText()
+                    def retList = new JsonSlurper().parseText(data)
+                    def awsRegion = retList[0]
+                    env.AWS_REGION = awsRegion
+
+                    sh """
+                        aws cloudformation describe-stacks --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --query 'Stacks[0].Parameters' > ${REVERTFILE}
+                    """
+                }
+            }
+        }
+
+        stage('Create Parameter File') {
+            steps {
+                script {
+                    def logLevel = env.Log_Level ?: error("Log_Level parameter not set")
+                    def revertJson = readFile("${REVERTFILE}")
+                    def parameters = new groovy.json.JsonSlurperClassic().parseText(revertJson)
+
+                    parameters.each { param ->
+                        if (param.ParameterKey == 'LogLevel') {
+                            echo "Original LogLevel: ${param.ParameterValue}"
+                            param.ParameterValue = logLevel
+                            echo "Updated LogLevel: ${param.ParameterValue}"
+                        }
+                    }
+
+                    def updatedJson = new groovy.json.JsonBuilder(parameters).toPrettyString()
+                    writeFile file: "${PARMFILE}", text: updatedJson
+                }
+            }
+        }
+
+        stage('Update Stack with Parameter File') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + env.ENVIRONMENT).getText()
+                    def retList = new JsonSlurper().parseText(data)
+                    def awsRegion = retList[0]
+
+                    sh """
+                        aws cloudformation update-stack --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --use-previous-template --capabilities CAPABILITY_NAMED_IAM --parameters file://"${PARMFILE}"
+                    """
+
+                    sh "aws cloudformation wait stack-update-complete --profile ${awsProfile} --region ${awsRegion} --stack-name ${STACK_NAME}"
+                }
+            }
+        }
+
+        stage('Wait for Specified Minutes') {
+            steps {
+                script {
+                    def waitDuration = env.DURATION ?: error("DURATION not set")
+                    sleep time: waitDuration.toInteger(), unit: 'MINUTES'
+                }
+            }
+        }
+
+        stage('Revert Logging Level') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + env.ENVIRONMENT).getText()
+                    def retList = new JsonSlurper().parseText(data)
+                    def awsRegion = retList[0]
+
+                    sh """
+                        aws cloudformation update-stack --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --use-previous-template --capabilities CAPABILITY_NAMED_IAM --parameters file://${REVERTFILE}
+                    """
+                }
+            }
+        }
+    }
+}

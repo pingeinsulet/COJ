@@ -1,0 +1,200 @@
+import groovy.json.JsonSlurper
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = "us-east-1"
+        // AWS_PROFILE = "default"
+        PHOME = "${WORKSPACE}"
+        PARAM_PATH = "${WORKSPACE}/params"
+        PARMFILE = "parm.json"
+        REVERTFILE = "revert.json"
+        SERVICE_PREFIX = ""
+        CLUSTER_NAME = "${env.CLUSTER_NAME}".replaceAll(",", "")
+        JENKINS_ENV = "https://jenkins.nonprod.webserver.insulet.com"
+    }
+
+    stages {
+        stage('Setup Directories') {
+            steps {
+                script {
+                    sh "mkdir -p '${PARAM_PATH}'"
+                }
+            }
+        }
+
+        stage('Check Approval Status') {
+            steps {
+                script {
+                    def jobType = "OOTP0001"
+                    def apiUrl = "${JENKINS_ENV}/approval/get_next_job.php?type=${jobType}"
+                    def jobNumberRaw = sh(
+                        script: "curl -s -k '${apiUrl}' | sed '/^\\s*\$/d'",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "API response (filtered): '${jobNumberRaw}'"
+
+                    if (!jobNumberRaw) {
+                        error "No job available for type ${jobType}. Skipping execution."
+                    }
+
+                    def jobNumber = jobNumberRaw.toInteger()
+                    echo "\u2714\ufe0f Valid job number received: ${jobNumber}"
+
+                    env.JOB_ID = jobNumber.toString()
+                }
+            }
+        }
+
+        stage('Fetch Parameters from Job File') {
+            steps {
+                script {
+                    def jobFilePath = "${PARAM_PATH}/job_${env.JOB_ID}.tmp"
+                    def fetchUrl = "${JENKINS_ENV}/approval/fetch_job_file.php?jobid=${env.JOB_ID}"
+
+                    echo "\ud83d\udcc4 Fetching jobfile from ${fetchUrl}"
+                    echo "\ud83d\udcc4 Temp job file path: ${jobFilePath}"
+
+                    sh "curl -sk '${fetchUrl}' -o '${jobFilePath}'"
+
+                    def lines = readFile(jobFilePath).readLines()
+                    for (line in lines) {
+                        line = line.trim()
+                        if (line.startsWith("#") || line.isEmpty()) continue
+                        def (key, value) = line.tokenize("=")
+                        key = key?.trim()?.toUpperCase()
+                        value = value?.trim()?.replaceAll(/^"|"$/, '')
+                        if (key && value) {
+                            echo "Setting env: ${key}=${value}"
+                            env."${key}" = value
+                        }
+                    }
+
+                    env.SERVICE_PREFIX = env.STACK_NAME.replaceAll('(?i)^(qa|int|perf|test)-|-?(qa|int|perf|test)$', '')
+                    env.AWS_PROFILE = env.ENVIRONMENT.replaceAll('(?i)^(qa|int|perf|test)-|-?(qa|int|perf|test)$', '')
+
+                    sh "rm -f '${jobFilePath}'"
+                }
+            }
+        }
+
+        stage('Get Existing Parameters') {
+            steps {
+                script {
+                    def data = new URL("${JENKINS_ENV}/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText()
+                    def retList = new JsonSlurper().parseText(data)
+                    awsRegion = retList[0]
+                    sh """
+                        aws cloudformation describe-stacks --region ${awsRegion} --profile ${AWS_PROFILE} \
+                        --stack-name '${env.STACK_NAME}' --query 'Stacks[0].Parameters' \
+                        > '${PARAM_PATH}/${env.STACK_NAME}.${REVERTFILE}'
+                    """
+                }
+            }
+        }
+
+        stage('Create Parameter File') {
+            steps {
+                script {
+                    def revertJson = readFile("${PARAM_PATH}/${env.STACK_NAME}.${REVERTFILE}")
+                    def parameters = new groovy.json.JsonSlurperClassic().parseText(revertJson)
+
+                    def ParameterKey = "${PARAMETER_KEY}" ?: error("Parameter Key parameter is not defined")
+                    def ParameterValue = "${PARAMETER_VALUE}" ?: error("Parameter Value parameter is not defined")
+
+                    def paramMap = [:]
+                    parameters.each { param ->
+                        paramMap[param.ParameterKey] = param.ParameterValue
+                    }
+
+                    paramMap[ParameterKey] = ParameterValue
+                    def formattedParams = paramMap.collect { key, value -> [ParameterKey: key, ParameterValue: value] }
+                    def updatedJson = new groovy.json.JsonBuilder(formattedParams).toPrettyString()
+                    writeFile file: "${PARAM_PATH}/${env.STACK_NAME}.${PARMFILE}", text: updatedJson
+                    echo "Generated JSON for Parameter Change"
+                }
+            }
+        }
+
+        stage('Update Stack with Parameter File') {
+            steps {
+                script {
+                    def data = new URL("${JENKINS_ENV}/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText()
+                    def retList = new JsonSlurper().parseText(data)
+                    awsRegion = retList[0]
+                    sh """
+                        date
+                        aws cloudformation update-stack --region ${awsRegion} --profile ${AWS_PROFILE} \
+                        --stack-name '${env.STACK_NAME}' --use-previous-template \
+                        --capabilities CAPABILITY_NAMED_IAM \
+                        --parameters file://${PARAM_PATH}/${env.STACK_NAME}.${PARMFILE}
+                        aws cloudformation wait stack-update-complete --region ${awsRegion} \
+                        --profile ${AWS_PROFILE} --stack-name ${env.STACK_NAME}
+                    """
+                }
+            }
+        }
+
+        stage('Wait for Specified Minutes') {
+            steps {
+                script {
+                    sleep time: "${env.DURATION}", unit: 'MINUTES'
+                }
+            }
+        }
+
+        stage('Revert Parameter Name') {
+            steps {
+                script {
+                    def data = new URL("${JENKINS_ENV}/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText()
+                    def retList = new JsonSlurper().parseText(data)
+                    def awsRegion = retList[0]
+                    sh """
+                        aws cloudformation update-stack --region ${awsRegion} --profile ${AWS_PROFILE} \
+                        --stack-name '${env.STACK_NAME}' --use-previous-template \
+                        --capabilities CAPABILITY_NAMED_IAM \
+                        --parameters file://${PARAM_PATH}/${env.STACK_NAME}.${REVERTFILE}
+                        aws cloudformation wait stack-update-complete --region ${awsRegion} \
+                        --profile ${AWS_PROFILE} --stack-name ${env.STACK_NAME}
+                    """
+                }
+            }
+        }
+    }
+}
+
+def calculateAndActOnStackAge(String taskStartTime) {
+    if (!taskStartTime) {
+        echo "Task start time is null or empty, skipping ECS service restart check."
+        return
+    }
+    def timestampMillis = Long.parseLong(taskStartTime)
+    def currentTimeMillis = System.currentTimeMillis()
+    def elapsedMillis = currentTimeMillis - timestampMillis
+    def elapsedMinutes = elapsedMillis / 60000
+
+    echo "Current (milliseconds): ${currentTimeMillis}"
+    echo "AWS most recent start (milliseconds): ${timestampMillis}"
+    echo "Elapsed Time (minutes): ${elapsedMinutes}"
+
+    if (elapsedMinutes > 10) {
+        echo "Restarting ECS service..."
+        def serviceName = "${env.SERVICE_PREFIX}".split('-')[-1]
+        def data = new URL("${JENKINS_ENV}/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText()
+        def retList = new JsonSlurper().parseText(data)
+        def awsRegion = retList[0]
+        sh """
+              aws ecs update-service --region ${awsRegion} --profile ${AWS_PROFILE} \
+              --cluster ${env.CLUSTER_NAME} --service ${serviceName} --force-new-deployment
+        """
+        echo "ECS service has been restarted."
+    } else {
+        echo "No need to restart ECS service as it has not been running for 10 minutes yet."
+    }
+}

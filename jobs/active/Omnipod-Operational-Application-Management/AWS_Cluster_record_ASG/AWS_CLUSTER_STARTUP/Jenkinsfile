@@ -1,0 +1,501 @@
+import groovy.json.JsonSlurper
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+
+    parameters {
+        string(name: 'JOB_ID', defaultValue: '', description: 'Optional: Job ID to restore. If empty, will poll API for next pending job.')
+    }
+
+    environment {
+        JOB_TYPE = "ACSS0001"
+        API_GET_JOB_URL = "http://jenkins.dev.webserver.insulet.com/approval/get_next_job.php"
+        API_FETCH_FILE_URL = "http://jenkins.dev.webserver.insulet.com/approval/fetch_job_file.php"
+    }
+
+    stages {
+        stage('Check for Pending Job') {
+            steps {
+                script {
+                    // If JOB_ID parameter is provided, use it directly
+                    if (params.JOB_ID && params.JOB_ID.trim() != '') {
+                        echo ""
+                        echo "=========================================="
+                        echo "ECS STARTUP - STEP 1: USING PROVIDED JOB ID"
+                        echo "=========================================="
+                        echo "Job ID provided: ${params.JOB_ID}"
+                        echo ""
+                        
+                        env.JOB_ID = params.JOB_ID.trim()
+                        env.HAS_JOB = 'true'
+                        echo "✓ Using provided job ID: ${env.JOB_ID}"
+                        return
+                    }
+                    
+                    // Otherwise, poll the API for next pending job
+                    def apiUrl = "${env.API_GET_JOB_URL}?type=${env.JOB_TYPE}"
+                    
+                    echo ""
+                    echo "=========================================="
+                    echo "ECS STARTUP - STEP 1: POLL FOR RESTORATION JOB"
+                    echo "=========================================="
+                    echo "Job Type: ${env.JOB_TYPE}"
+                    echo "API URL: ${apiUrl}"
+                    echo ""
+                    
+                    def jobNumberRaw = sh(
+                        script: "curl -s -k '${apiUrl}' | sed '/^\\s*\$/d'",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "API response (filtered): '${jobNumberRaw}'"
+
+                    if (!jobNumberRaw || jobNumberRaw == '' || jobNumberRaw == 'NONE') {
+                        echo "=========================================="
+                        echo "✓ No pending restoration job found"
+                        echo "✓ Exiting successfully (no work to do)"
+                        echo "=========================================="
+                        currentBuild.result = 'SUCCESS'
+                        return
+                    }
+
+                    def jobNumber = jobNumberRaw.toInteger()
+                    echo "✓ Valid job number received: ${jobNumber}"
+
+                    env.JOB_ID = jobNumber.toString()
+                    env.HAS_JOB = 'true'
+                }
+            }
+        }
+
+        stage('Fetch Job Parameters') {
+            when {
+                expression { env.HAS_JOB == 'true' }
+            }
+            steps {
+                script {
+                    def jobFilePath = sh(script: "mktemp", returnStdout: true).trim()
+                    def fetchUrl = "${env.API_FETCH_FILE_URL}?jobid=${env.JOB_ID}"
+
+                    echo "=========================================="
+                    echo "ECS STARTUP - STEP 2: FETCHING JOB FILE"
+                    echo "=========================================="
+                    echo "Job ID: ${env.JOB_ID}"
+                    echo "Fetch URL: ${fetchUrl}"
+                    echo "Temp file path: ${jobFilePath}"
+                    echo ""
+
+                    sh """
+                        curl -sk '${fetchUrl}' -o '${jobFilePath}'
+                    """
+
+                    // Display the raw job file for debugging
+                    def rawContent = readFile(jobFilePath)
+                    echo "Raw job file content:"
+                    echo "----------------------------------------"
+                    echo rawContent
+                    echo "----------------------------------------"
+                    echo ""
+
+                    // Parse the job file and load parameters into environment
+                    def lines = rawContent.readLines()
+                    def serviceList = []
+                    
+                    for (line in lines) {
+                        line = line.trim()
+                        if (line.startsWith("#") || line.isEmpty()) continue
+                        
+                        def parts = line.tokenize("=")
+                        if (parts.size() < 2) continue
+                        
+                        def key = parts[0]?.trim()
+                        def value = parts.drop(1).join("=").trim()?.replaceAll(/^"|"$/, '')
+                        
+                        if (key && value) {
+                            echo "Setting env: ${key}=${value}"
+                            env."${key}" = value
+                            
+                            // Track services that have DESIRED_COUNT (all services should have this)
+                            // Extract service name while preserving case
+                            if (key.endsWith('_DESIRED_COUNT')) {
+                                def serviceName = key.replaceAll(/_DESIRED_COUNT$/, '')
+                                if (!serviceList.contains(serviceName)) {
+                                    serviceList.add(serviceName)
+                                }
+                            }
+                        }
+                    }
+
+                    // Display what was loaded for debugging
+                    echo ""
+                    echo "=========================================="
+                    echo "LOADED PARAMETERS (DEBUG)"
+                    echo "=========================================="
+                    echo "Environment: ${env.ENVIRONMENT}"
+                    echo "Cluster: ${env.CLUSTER_NAME}"
+                    echo ""
+                    for (def svc in serviceList) {
+                        echo "\n${svc}:"
+                        echo "  DESIRED_COUNT: ${env."${svc}_DESIRED_COUNT"}"
+                        echo "  HAS_AUTOSCALING: ${env."${svc}_HAS_AUTOSCALING"}"
+                        if (env."${svc}_HAS_AUTOSCALING" == 'true') {
+                            echo "  MIN_CAPACITY: ${env."${svc}_MIN_CAPACITY"}"
+                            echo "  MAX_CAPACITY: ${env."${svc}_MAX_CAPACITY"}"
+                            echo "  ROLE_ARN: ${env."${svc}_ROLE_ARN"}"
+                        }
+                    }
+                    echo "=========================================="
+                    
+                    sh "rm -f '${jobFilePath}'"
+                    
+                    // Store service list for next stage
+                    env.SERVICE_LIST = serviceList.join(',')
+                    env.TOTAL_SERVICES = serviceList.size().toString()
+                    
+                    echo ""
+                    echo "=========================================="
+                    echo "✓ Job file loaded successfully"
+                    echo "Total services: ${env.TOTAL_SERVICES}"
+                    echo "Services: ${serviceList.join(', ')}"
+                    echo "=========================================="
+                }
+            }
+        }
+       
+        stage('Restore ECS Service Desired Counts') {
+            when {
+                expression { env.HAS_JOB == 'true' && env.SERVICE_LIST }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "ECS STARTUP - STEP 3: RESTORING ECS SERVICE DESIRED COUNTS"
+                    echo "=========================================="
+                    echo "Environment: ${env.ENVIRONMENT}"
+                    echo "Cluster: ${env.CLUSTER_NAME}"
+                    echo "AWS Profile: ${env.AWS_PROFILE}"
+                    echo "AWS Region: ${env.AWS_REGION}"
+                    echo ""
+                    
+                    def services = env.SERVICE_LIST.split(',')
+                    def successCount = 0
+                    def skipCount = 0
+                    def errorCount = 0
+                    
+                    for (def serviceName in services) {
+                        if (!serviceName || serviceName.trim() == '') continue
+                        
+                        echo "\n----------------------------------------"
+                        echo "Restoring Service: ${serviceName}"
+                        echo "----------------------------------------"
+                        
+                        // Get the desired count for this service
+                        def desiredCount = env."${serviceName}_DESIRED_COUNT"
+                        
+                        if (!desiredCount) {
+                            echo "⚠ No desired count found for ${serviceName}, skipping"
+                            skipCount++
+                            continue
+                        }
+                        
+                        echo "  Target Desired Count: ${desiredCount}"
+                        
+                        try {
+                            // Update the ECS service desired count
+                            echo "  → Updating ECS service desired count..."
+                            
+                            def updateCommand = """aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} ecs update-service --cluster ${env.CLUSTER_NAME} --service ${serviceName} --desired-count ${desiredCount}"""
+                            echo "  → Executing: ${updateCommand}"
+                            
+                            def result = sh(
+                                script: updateCommand,
+                                returnStdout: true
+                            ).trim()
+                            
+                            echo "  → AWS Response: ${result}"
+                            echo "  ✓ Service desired count restored to ${desiredCount}"
+                            successCount++
+                            
+                        } catch (Exception e) {
+                            echo "  ✗ Error restoring service ${serviceName}: ${e.message}"
+                            errorCount++
+                        }
+                    }
+                    
+                    echo "\n=========================================="
+                    echo "SERVICE RESTORATION SUMMARY"
+                    echo "=========================================="
+                    echo "✓ Successful: ${successCount}"
+                    echo "⊘ Skipped: ${skipCount}"
+                    echo "✗ Errors: ${errorCount}"
+                    echo "Total processed: ${successCount + skipCount + errorCount}"
+                    echo "=========================================="
+                    
+                    if (errorCount > 0) {
+                        echo "\n⚠ WARNING: Some services failed to restore"
+                        echo "Check the logs above for details"
+                    }
+                }
+            }
+        }
+       
+        stage('Restore ASG Settings') {
+            when {
+                expression { env.HAS_JOB == 'true' && env.SERVICE_LIST }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "ECS STARTUP - STEP 4: RESTORING AUTO SCALING SETTINGS"
+                    echo "=========================================="
+                    echo "Restoring ASG min/max capacity settings"
+                    echo ""
+                    
+                    def services = env.SERVICE_LIST.split(',')
+                    def successCount = 0
+                    def skipCount = 0
+                    def errorCount = 0
+                    
+                    for (def serviceName in services) {
+                        if (!serviceName || serviceName.trim() == '') continue
+                        
+                        echo "\n----------------------------------------"
+                        echo "ASG for: ${serviceName}"
+                        echo "----------------------------------------"
+                        
+                        // Check if this service has autoscaling enabled
+                        def asgEnabled = env."${serviceName}_HAS_AUTOSCALING"
+                        if (asgEnabled != 'true') {
+                            echo "⊘ Autoscaling not enabled for ${serviceName}, skipping"
+                            skipCount++
+                            continue
+                        }
+                        
+                        // Get ASG parameters for this service
+                        def minCapacity = env."${serviceName}_MIN_CAPACITY"
+                        def maxCapacity = env."${serviceName}_MAX_CAPACITY"
+                        def roleArn = env."${serviceName}_ROLE_ARN"
+                        
+                        if (!minCapacity || !maxCapacity || !roleArn) {
+                            echo "⚠ Missing required ASG parameters for ${serviceName}, skipping"
+                            skipCount++
+                            continue
+                        }
+                        
+                        echo "  Min Capacity: ${minCapacity}"
+                        echo "  Max Capacity: ${maxCapacity}"
+                        echo "  Role ARN: ${roleArn}"
+                        
+                        try {
+                            // Check if the scalable target already exists
+                            def existingTarget = sh(
+                                script: """
+                                    aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} \
+                                    application-autoscaling describe-scalable-targets \
+                                    --service-namespace ecs \
+                                    --resource-id service/${env.CLUSTER_NAME}/${serviceName} \
+                                    --query 'ScalableTargets[0].ResourceId' \
+                                    --output text 2>/dev/null || echo 'NONE'
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (existingTarget != 'NONE' && existingTarget != 'None' && existingTarget != '') {
+                                echo "  ℹ ASG target already exists, updating..."
+                            } else {
+                                echo "  ℹ ASG target does not exist, creating..."
+                            }
+                            
+                            // Build and execute the AWS command
+                            echo "  → Registering scalable target..."
+                            
+                            def asgCommand = """aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} application-autoscaling register-scalable-target --service-namespace ecs --resource-id service/${env.CLUSTER_NAME}/${serviceName} --scalable-dimension ecs:service:DesiredCount --min-capacity ${minCapacity} --max-capacity ${maxCapacity} --role-arn ${roleArn}"""
+                            echo "  → Executing: ${asgCommand}"
+                            
+                            def asgResult = sh(
+                                script: asgCommand,
+                                returnStdout: true
+                            ).trim()
+                            
+                            echo "  → AWS Response: ${asgResult}"
+                            echo "  ✓ ASG settings restored successfully"
+                            successCount++
+                            
+                        } catch (Exception e) {
+                            echo "  ✗ Error restoring ASG for ${serviceName}: ${e.message}"
+                            errorCount++
+                        }
+                    }
+                    
+                    echo "\n=========================================="
+                    echo "ASG RESTORATION SUMMARY"
+                    echo "=========================================="
+                    echo "✓ Successful: ${successCount}"
+                    echo "⊘ Skipped: ${skipCount}"
+                    echo "✗ Errors: ${errorCount}"
+                    echo "Total processed: ${successCount + skipCount + errorCount}"
+                    echo "=========================================="
+                    
+                    if (errorCount > 0) {
+                        echo "\n⚠ WARNING: Some services failed to restore ASG settings"
+                        echo "Check the logs above for details"
+                    }
+                }
+            }
+        }
+        
+        stage('Verify Restoration') {
+            when {
+                expression { env.HAS_JOB == 'true' && env.SERVICE_LIST }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "ECS STARTUP - STEP 5: VERIFYING RESTORATION"
+                    echo "=========================================="
+                    echo "Checking current state of services..."
+                    echo ""
+                    
+                    def services = env.SERVICE_LIST.split(',')
+                    
+                    for (def serviceName in services) {
+                        if (!serviceName || serviceName.trim() == '') continue
+                        
+                        echo "\n${serviceName}:"
+                        
+                        try {
+                            // Get current desired count
+                            def currentDesired = sh(
+                                script: """
+                                    aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} \
+                                    ecs describe-services \
+                                    --cluster ${env.CLUSTER_NAME} \
+                                    --services ${serviceName} \
+                                    --query 'services[0].desiredCount' \
+                                    --output text
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            
+                            def currentRunning = sh(
+                                script: """
+                                    aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} \
+                                    ecs describe-services \
+                                    --cluster ${env.CLUSTER_NAME} \
+                                    --services ${serviceName} \
+                                    --query 'services[0].runningCount' \
+                                    --output text
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            
+                            def expectedDesired = env."${serviceName}_DESIRED_COUNT"
+                            
+                            echo "  Expected Desired: ${expectedDesired}"
+                            echo "  Current Desired:  ${currentDesired}"
+                            echo "  Current Running:  ${currentRunning}"
+                            
+                            if (currentDesired == expectedDesired) {
+                                echo "  ✓ Desired count matches!"
+                            } else {
+                                echo "  ✗ WARNING: Desired count mismatch!"
+                            }
+                            
+                            // Check ASG settings if enabled
+                            if (env."${serviceName}_HAS_AUTOSCALING" == 'true') {
+                                def asgInfo = sh(
+                                    script: """
+                                        aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} \
+                                        application-autoscaling describe-scalable-targets \
+                                        --service-namespace ecs \
+                                        --resource-id service/${env.CLUSTER_NAME}/${serviceName} \
+                                        --query 'ScalableTargets[0].[MinCapacity,MaxCapacity]' \
+                                        --output text 2>/dev/null || echo 'NONE'
+                                    """,
+                                    returnStdout: true
+                                ).trim()
+                                
+                                if (asgInfo != 'NONE' && asgInfo != '') {
+                                    def parts = asgInfo.split('\t')
+                                    echo "  ASG Min: ${parts[0]}, Max: ${parts[1]}"
+                                    
+                                    def expectedMin = env."${serviceName}_MIN_CAPACITY"
+                                    def expectedMax = env."${serviceName}_MAX_CAPACITY"
+                                    
+                                    if (parts[0] == expectedMin && parts[1] == expectedMax) {
+                                        echo "  ✓ ASG settings match!"
+                                    } else {
+                                        echo "  ✗ WARNING: ASG settings mismatch!"
+                                        echo "    Expected Min: ${expectedMin}, Max: ${expectedMax}"
+                                    }
+                                } else {
+                                    echo "  ⚠ No ASG configuration found"
+                                }
+                            }
+                            
+                        } catch (Exception e) {
+                            echo "  ✗ Error verifying ${serviceName}: ${e.message}"
+                        }
+                    }
+                    
+                    echo "\n=========================================="
+                    echo "VERIFICATION COMPLETE"
+                    echo "=========================================="
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                echo ""
+                echo "=========================================="
+                echo "ECS STARTUP COMPLETED SUCCESSFULLY"
+                echo "=========================================="
+                if (env.HAS_JOB == 'true') {
+                    echo "✓ ECS restoration job completed"
+                    echo "  Job ID: ${env.JOB_ID}"
+                    echo "  Environment: ${env.ENVIRONMENT}"
+                    echo "  Cluster: ${env.CLUSTER_NAME}"
+                } else {
+                    echo "✓ No pending restoration jobs found"
+                }
+                echo "=========================================="
+            }
+        }
+        
+        failure {
+            script {
+                echo ""
+                echo "=========================================="
+                echo "ECS STARTUP FAILED"
+                echo "=========================================="
+                if (env.HAS_JOB == 'true') {
+                    echo "✗ ECS restoration job failed"
+                    echo "  Job ID: ${env.JOB_ID}"
+                } else {
+                    echo "✗ Error during startup process"
+                }
+                echo "Check the logs above for details"
+                echo "=========================================="
+            }
+        }
+        
+        aborted {
+            echo ""
+            echo "=========================================="
+            echo "ECS STARTUP ABORTED"
+            echo "=========================================="
+            echo "⊘ Startup job was cancelled"
+            echo "=========================================="
+        }
+    }
+}

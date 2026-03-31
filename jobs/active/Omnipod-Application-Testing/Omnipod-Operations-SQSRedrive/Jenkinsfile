@@ -1,0 +1,43 @@
+import groovy.json.JsonSlurper
+pipeline {
+    agent {
+          ecs {
+                inheritFrom "jenkins-agent"
+                 }
+            } 
+    environment {
+        ENVIRONMENT = "${env.ENVIRONMENT}"
+    }
+
+    stages {
+        stage('SQS redrive Process') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("http://10.200.2.219/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+                    awsRegion = retList[0] 
+                    sh """
+                    aws --profile ${awsProfile} --region ${awsRegion} sqs get-queue-attributes --queue-url ${env.SQS_Queue_URL} --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+                    aws --profile ${awsProfile} --region ${awsRegion} sqs start-message-move-task --source-arn ${env.SQS_ARN} --max-number-of-messages-per-second ${env.Max_Messages_ps}
+                    """
+                }
+            }
+        }
+
+        stage('Monitor process until ApproximateNumberOfMessages is 0 ') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("http://10.200.2.219/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+                    awsRegion = retList[0] 
+                    sh """
+                    sleep 15
+                    aws --profile ${awsProfile}  --region ${awsRegion} sqs get-queue-attributes --queue-url ${env.SQS_Queue_URL} --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+                    """
+                }
+            }
+        }
+    }
+}

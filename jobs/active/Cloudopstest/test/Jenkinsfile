@@ -1,0 +1,40 @@
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    } // Use your custom agent label which has Kaniko included
+    environment {
+        AWS_REGION    = 'us-east-1'
+        // Replace with your AWS ECR registry (e.g., <aws_account_id>.dkr.ecr.<region>.amazonaws.com)
+        ECR_REGISTRY  = '221773438705.dkr.ecr.us-east-1.amazonaws.com'
+        IMAGE_NAME    = 'jenkins-kaniko-testing'
+        IMAGE_TAG     = 'latest'
+    }
+    stages {
+        stage('Prepare Dockerfile') {
+            steps {
+                // Dynamically create a Dockerfile that defines a basic image printing "Hello, World!"
+                sh '''
+cat <<EOF > Dockerfile
+FROM alpine:latest
+CMD ["echo", "Hello, World!"]
+EOF
+                '''
+            }
+        }
+        stage('Build & Push with Kaniko') {
+            steps {
+                // Run Kaniko to build the Docker image and push it to AWS ECR.
+                // Kaniko will use the Dockerfile and context from the workspace.
+                sh '''
+                   /kaniko/executor \
+                     --dockerfile=${WORKSPACE}/Dockerfile \
+                     --context=${WORKSPACE} \
+                     --destination=${ECR_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                     --skip-tls-verify=true
+                   '''
+            }
+        }
+    }
+}

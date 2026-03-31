@@ -1,0 +1,104 @@
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+    
+    stages {
+        stage('Clone Repository') {
+            steps {
+                echo "Cloning repository..."
+                git credentialsId: 'git-cloud-tools',
+                    branch: "main",
+                    url: "https://bitbucket.insulet.com/scm/cld/cloud-tools.git"
+            }
+        }
+        
+        stage('Setup Python Environment') {
+            steps {
+                echo 'Setting up Python virtual environment...'
+                // Using the dot (.) operator so that the script works with /bin/sh as well.
+                sh '''
+                    python3 -m venv integrator-bootstrap-env
+                    . integrator-bootstrap-env/bin/activate
+                    pip3 install -r integrator-bootstrap/requirements.txt
+                '''
+            }
+        }
+        
+        stage('Run Integrator Bootstrap Script') {
+            steps {
+                // Retrieve the Mongo connection string using the provided ENVIRONMENT credential.
+                // Note: Here, the ENVIRONMENT parameter is also used to look up the Jenkins credential
+                // that holds the Mongo connection string.
+                withCredentials([string(credentialsId: params.Environment, variable: 'MONGO_CONNECTION_STRING')]) {
+                    sh """
+                        #!/bin/bash
+                        . integrator-bootstrap-env/bin/activate
+                        python3 integrator-bootstrap/integrator_bootstrap.py \\
+                            --connection_string '${MONGO_CONNECTION_STRING}' \\
+                            --integrator_id '${params.INTEGRATOR_ID}' \\
+                            --data_types 'cgmReading' 'cgmEvent' \\
+                            --authorized_cgm_sensors 'L2' \\
+                            --compatible_consent_modes 'AB' \\
+                            --auth_type 'BASIC' \\
+                            --region '${REGION}' \\
+                            --revocation_url '${params.REVOCATION_URL}' \\
+                            --notification_url '${params.NOTIFICATION_URL}'
+                    """
+                }
+            }
+        }
+        
+        stage('Test Lambda Function') {
+            steps {
+                script {
+                    // Parse the ENVIRONMENT parameter (dash-separated)
+                    def parts = params.Environment.split('-')
+                    def awsProfile = parts[0]
+                    // Use second entry if available; otherwise default to first part.
+                    def lambdaEnv = parts.size() > 1 ? parts[1] : parts[0]
+                    // Determine AWS region based on lambdaEnv.
+                    def lambdaRegion = awsProfile.toUpperCase().startsWith("EU") ? "eu-west-1" : "us-east-1"
+                    // Construct the Lambda function name.
+                    def lambdaFunctionName = "${lambdaEnv}-IntegratorSecrets-Function"
+                    
+                    // Create JSON payload for the test event.
+                    def payload = groovy.json.JsonOutput.toJson([
+                        username    : "test",
+                        password    : "test",
+                        integratorId: params.INTEGRATOR_ID,
+                        region      : lambdaRegion,
+                        overrideSecret: false
+                    ])
+                    
+                    echo "AWS Profile: ${awsProfile}"
+                    echo "Lambda Environment: ${lambdaEnv}"
+                    echo "Computed Region: ${lambdaRegion}"
+                    echo "Invoking Lambda function: ${lambdaFunctionName}"
+                    echo "Payload: ${payload}"
+                    
+                    // Invoke the Lambda function using the AWS CLI.
+                    // Make sure AWS CLI is configured on the Jenkins agent.
+                    sh """
+                        aws lambda invoke --function-name ${lambdaFunctionName} \\
+                            --region ${lambdaRegion} \\
+                            --payload '${payload}' response.json
+                        echo "Lambda response:"
+                        cat response.json
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo 'Cleaning up...'
+            // Deactivate the virtual environment if active.
+            sh 'deactivate || true'
+            deleteDir()
+        }
+    }
+}

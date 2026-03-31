@@ -1,0 +1,83 @@
+pipeline {
+    agent {
+        ecs {
+            inheritFrom 'jenkins-agent'
+        }
+    }
+
+    environment {
+        Desc = "Jenkins parameter storage Test"
+        type = "${env.JobType}"
+        applist1 = "${env.applist1 ?: 'defaultApp'}"
+        applist2 = ""
+        applist3 = ""
+        expdays = "20"
+        API_URL = "https://jenkins.nonprod.webserver.insulet.com/approval/create_approval_job.php"
+    }
+
+    stages {
+        stage('Generate Temp File') {
+            steps {
+                script {
+                    env.REQFILE = sh(script: "mktemp /tmp/agreq.XXXXXX.txt", returnStdout: true).trim()
+                    echo "Generated temp file: ${env.REQFILE}"
+                }
+            }
+        }
+
+        stage('Prepare Request File') {
+            steps {
+                script {
+                    echo "Build started by: ${BUILD_USER}"
+
+                    def reqContent = """
+                    # === Job Parameters Below ===
+                    AGuserid="${BUILD_USER}"
+                    ENVIRONMENTLIST=${env.EnvironmentList}
+                    APPTYPE="${env.AppType}"
+                    CERTDATE=${env.CertificateDate}
+                    EMAIL="${env.EmailAddr}"
+                    DRYRUN=${env.DryRun}
+                    """
+
+                    def filteredContent = reqContent
+                        .split('\n')
+                        .collect { it.trim() }
+                        .findAll { it }
+                        .join('\n') + '\n'
+
+                    writeFile file: env.REQFILE, text: filteredContent
+                    echo "Request file content written to ${env.REQFILE}:"
+                    echo filteredContent
+                }
+            }
+        }
+
+        stage('Upload File via Curl') {
+            steps {
+                script {
+                    def curlCommand = """
+                    curl -v -k -F "type=${env.JobType}" -F "jobfile=@${env.REQFILE}" ${env.API_URL}
+                    """
+                    def response = sh(script: curlCommand, returnStdout: true).trim()
+                    echo "Curl response:\n${response}"
+
+                    if (response ==~ /^\\s*$/) {
+                        error("API returned blank output. Check server logs and input file formatting.")
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (env.REQFILE) {
+                    sh "rm -f ${env.REQFILE}"
+                    echo "Temp file ${env.REQFILE} removed."
+                }
+            }
+        }
+    }
+}

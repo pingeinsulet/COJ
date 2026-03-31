@@ -1,0 +1,40 @@
+import groovy.json.JsonSlurper
+pipeline {
+    agent {
+          ecs {
+                inheritFrom "jenkins-agent"
+                 }
+            }  
+    environment {
+        ECS_CLUSTER_NAME = "${env.CLUSTER}"
+        STATE = "${env.STATE}"
+    }
+
+    stages {
+        stage('Set ECS Service Desired Count to 0 or 1') {
+            steps {
+                script {
+                    // List ECS services and update their desired count to 0
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("https://jenkins.dev.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+                    awsRegion = retList[0] 
+                    echo "${awsProfile}"
+                    def services = sh(script: "aws --profile ${awsProfile} --region ${awsRegion} ecs list-services --cluster ${env.CLUSTER.replaceAll(",", "")} | jq -r '.serviceArns[]' | xargs -n 1 aws --profile ${awsProfile} --region ${awsRegion} ecs update-service --cluster ${env.CLUSTER.replaceAll(",", "")} --desired-count ${env.STATE} --service", returnStdout: true).trim()
+                    echo "Updated the desired count to ${env.STATE} for the following ECS services:"
+                    echo "${services}"
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "ECS services in ${env.CLUSTER} have been set to ${env.STATE} successfully."
+        }
+
+        failure {
+            echo "Failed to update ECS services to ${env.STATE} in ${env.CLUSTER}. Check the logs for details."
+        }
+    }
+}

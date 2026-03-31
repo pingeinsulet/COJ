@@ -1,0 +1,7 @@
+This job uses Pipeline from SCM (no inline script in config.xml).
+
+Git URL: ssh://git@bitbucket.insulet.com/cldops/jenkins-pipelines.git
+Branch: */dynamodb-value-description-update
+Script path: jenkinsfile-dynamo-copy-tables
+
+Clone the repository above and use the script path as the Jenkinsfile location.

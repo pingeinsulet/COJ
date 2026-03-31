@@ -1,0 +1,142 @@
+def remote = [:]
+remote.name = "ec2-instance"
+remote.host = "10.246.213.155"
+def assumeRoleCmd
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+
+    stages {
+        stage('Prepare SSH Connection') {
+            steps {
+                script {
+                    remote.allowAnyHosts = true
+                    remote.user = params.EC2_USER
+                    remote.identityFile = "/var/jenkins_home/${params.EC2_USER}"
+
+                    echo "Testing SSH connection..."
+                    sshCommand remote: remote, command: 'echo "Connected as $(whoami)"'
+                }
+            }
+        }
+
+        stage('Assume IAM role') {
+            steps {
+                script {
+                        // Get AWS account ID from Jenkins (runs on the Jenkins agent) and get the role name from Jenkins parameters.
+                        def accountId = sh(script: "aws sts get-caller-identity --query 'Account' --output text", returnStdout: true).trim()
+                        def roleName = params.ROLE_NAME  // Ensure this parameter is defined in Jenkins
+                        def roleArn = "arn:aws:iam::${accountId}:role/${roleName}"
+                        echo "Using role ARN: ${roleArn}"
+
+                        // Build the assume-role commands to run on the remote host
+                        assumeRoleCmd = """\
+TEMP_ACCESS_ACCOUNT=\$(aws sts assume-role --role-arn ${roleArn} --role-session-name example)
+export AWS_ACCESS_KEY_ID=\$(echo \$TEMP_ACCESS_ACCOUNT | jq -r '.Credentials.AccessKeyId')
+export AWS_SECRET_ACCESS_KEY=\$(echo \$TEMP_ACCESS_ACCOUNT | jq -r '.Credentials.SecretAccessKey')
+export AWS_SESSION_TOKEN=\$(echo \$TEMP_ACCESS_ACCOUNT | jq -r '.Credentials.SessionToken')
+echo "Assumed cross-account role on remote host."
+"""
+                        // sshCommand remote: remote, command: assumeRoleCmd
+                }
+            }
+        }
+
+        stage('Delete Existing Env Folder') {
+            steps {
+                script {
+                    if (params.DELETE_EXISTING_ENV == "true") {
+                        def envFolder = "/home/${params.EC2_USER}/deploy/${params.ENVIRONMENT}"
+                        sshCommand remote: remote, command: "rm -rf ${envFolder}"
+                        echo "Deleted folder: ${envFolder}"
+                    } else {
+                        echo "Skipping deletion of environment folder."
+                    }
+                }
+            }
+        }
+
+        stage('Run setup-new-deployment') {
+            steps {
+                script {
+                    if (params.RUN_SETUP_NEW_DEPLOYMENT == "true") {
+                        def cmd = "cd /home/${params.EC2_USER}/deploy/tools && bash setup-new-deployment-new.sh ${params.ENVIRONMENT} ${params.VERSION} ${params.EMAIL}"
+                        sshCommand remote: remote, command: cmd
+                    } else {
+                        echo "Skipping setup-new-deployment script."
+                    }
+                }
+            }
+        }
+
+        stage('Run prepare') {
+            steps {
+                script {
+                    if (params.RUN_PREPARE == "true") {
+                        def cmd = "cd /home/${params.EC2_USER}/deploy && bash prepare.sh ${params.ENVIRONMENT}"
+                        def fullCommand = assumeRoleCmd + "\n" + cmd
+                        sshCommand remote: remote, command: fullCommand
+                    } else {
+                        echo "Skipping prepare script."
+                    }
+                }
+            }
+        }
+
+        stage('Run pre-deploy-report') {
+            steps {
+                script {
+                    if (params.RUN_PRE_DEPLOY_REPORT == "true") {
+                        def cmd = "cd /home/${params.EC2_USER}/deploy && bash pre-deploy-report-new.sh ${params.ENVIRONMENT}"
+                        def fullCommand = assumeRoleCmd + "\n" + cmd
+                        sshCommand remote: remote, command: fullCommand
+                    } else {
+                        echo "Skipping pre-deploy-report script."
+                    }
+                }
+            }
+        }
+
+        stage('Run run-deploy') {
+            steps {
+                script {
+                    if (params.RUN_RUN_DEPLOY == "true") {
+                        def cmd = "cd /home/${params.EC2_USER}/deploy && bash run-deploy.sh ${params.ENVIRONMENT} log"
+                        sshCommand remote: remote, command: cmd
+                    } else {
+                        echo "Skipping run-deploy script."
+                    }
+                }
+            }
+        }
+
+        stage('Run update-golive') {
+            steps {
+                script {
+                    if (params.RUN_UPDATE_GOLIVE == "true") {
+                        def cmd = "cd /home/${params.EC2_USER}/deploy/tools && bash update-golive.sh /home/${params.EC2_USER}/deploy/${params.ENVIRONMENT}"
+                        sshCommand remote: remote, command: cmd
+                    } else {
+                        echo "Skipping update-golive script."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline completed."
+        }
+        success {
+            echo "Pipeline succeeded."
+        }
+        failure {
+            echo "Pipeline failed. Please review the logs for details."
+        }
+    }
+}

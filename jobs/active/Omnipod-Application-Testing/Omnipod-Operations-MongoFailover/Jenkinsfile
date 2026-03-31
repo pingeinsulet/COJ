@@ -1,0 +1,53 @@
+pipeline {
+    agent {
+          ecs {
+                inheritFrom "jenkins-agent"
+                 }
+            }  
+
+    stages {
+        stage('Make API Request') {
+            environment {
+                // Define environment variables for MongoDB API
+                // M_API_KEY = credentials('mongoApiKey')  // Jenkins credential for API key
+                M_API_URL = 'https://cloud.mongodb.com/api/public/v1.0/groups?pretty=true'
+                M_CLIENT_AUTH = credentials('client-auth-mongo-token')
+    }
+            steps {
+                script {
+                    // Split the environment variable into an array 
+                    def MongoClusterVar = env.MONGO_CLUSTER_NAME.split(',') 
+                    // Assign the first element 
+                    def MongoCluster = MongoClusterVar[0] 
+                    // Assign the second element 
+                    def ProjectID = MongoClusterVar[1] 
+                    // Print values to verify 
+                    echo "MongoCluster: ${MongoCluster}" 
+                    echo "ProjectID: ${ProjectID}"                    
+                        def apiResponse = sh(
+                    script: """
+                            sh 'curl --request POST --url https://cloud.mongodb.com/api/oauth/token --header 'accept: application/json'  --header 'cache-control: no-cache' --header 'authorization: Basic '$M_CLIENT_AUTH' --header 'content-type: application/x-www-form-urlencoded' --data 'grant_type=client_credentials''
+                        """,
+                        returnStdout: true
+                        ).trim()                        
+                        echo "apiResponse: ${apiResponse}"
+                        // Use Groovy's replaceFirst to extract the actual token
+                        def token = apiResponse.replaceFirst(/.*"access_token":"([^"]+)".*/, '$1')
+                        println "Extracted token: ${token}"
+                        def apiFailover = sh(
+                    script: """
+                            'curl --request POST --header 'Authorization: Bearer ${token}' --header "Accept: application/vnd.atlas.2024-08-05+json" --include \\ --request POST "https://cloud.mongodb.com/api/atlas/v2/groups/${ProjectID}/clusters/${MongoCluster}/restartPrimaries'
+                        """,
+                        returnStdout: true
+                        ).trim()
+                         println "Failover Complete: ${apiFailover}"
+                    script: """
+                            wait 180
+                            atlas clusters describe ${MongoCluster}
+                        """
+                         println "cluster information for ${MongoCluster}"  
+                }
+            }
+        }
+    }
+}

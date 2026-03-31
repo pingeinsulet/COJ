@@ -1,0 +1,65 @@
+pipeline {
+    agent {
+          ecs {
+                inheritFrom "jenkins-agent"
+                 }
+            }  
+    environment {
+        //maybe put profiles here to keep from multiple occurances
+        SOURCE_BUCKET = "s3://omnipod-release-artifacts/${Version}"
+        DESTINATION_BUCKET = "s3://insulet-omnipod-releases/${Version}"
+    }
+//    parameters {
+//        string(name: 'Version', defaultValue: '', description: 'Release version')
+//        choice(name: 'RELEASE_TYPE', choices: ['New Release', 'Release Candidate'], description: 'Release Type')
+//    }
+    stages {
+        stage('Prepare Release Folder') {
+            when {
+                expression { params.RELEASE_TYPE == 'New Release' }
+            }
+            steps {
+                script {
+                sh "aws s3 --profile JenkinsOmnipodRelease mb s3://insulet-omnipod-releases/${env.Version} && ls -al"
+                    //sh "aws s3 --profile JenkinsOmnipodRelease  ls ${env.DESTINATION_BUCKET} || aws s3 --profile JenkinsOmnipodRelease mb ${env.DESTINATION_BUCKET} && ls -al"
+                }
+            }
+        }
+        stage('Copy Artifacts') {
+            steps {
+                script {
+                    sh "which bash"
+                    // Copy artifacts from source to destination
+                    sh "aws s3 cp --profile InsuletAdmin --recursive ${env.SOURCE_BUCKET} ${env.Version}"
+                    sleep 3 //just to avoid a race condition
+                    sh "aws s3 cp --profile JenkinsOmnipodRelease --recursive ${env.Version} ${env.DESTINATION_BUCKET}"
+                }
+            }
+        }
+        stage('Validate Artifacts') {
+            steps {
+                script {
+                    sh '''
+                    git clone https://bitbucket.insulet.com/scm/cldops/clouddeployment.git
+                    git clone https://bitbucket.insulet.com/scm/cldops/deploymenttemplatelibrary.git
+                    cd deploymenttemplatelibrary
+                    git checkout develop
+                    cd ../clouddeployment/deploy-cloud
+                    git checkout develop
+                    mv templates templates-org
+                    ln -s ../../deploymenttemplatelibrary/templates .
+                    export RELEASE_TEMPLATES=../../deploymenttemplatelibrary
+                    export AWS_PROFILE=WAADS3ACCESS
+                    cd tools/releasecheck
+                    ./releasecheck.sh "${Version}" "${Email}"
+                    '''
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            echo 'Failure encountered during release verification. Check the logs for details.'
+        }
+    }
+}

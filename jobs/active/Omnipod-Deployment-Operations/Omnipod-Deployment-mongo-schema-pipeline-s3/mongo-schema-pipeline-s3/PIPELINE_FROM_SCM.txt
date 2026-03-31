@@ -1,0 +1,7 @@
+This job uses Pipeline from SCM (no inline script in config.xml).
+
+Git URL: ssh://git@bitbucket.insulet.com/cldops/jenkins-pipelines
+Branch: */mongo-test
+Script path: Jenkinsfile-pipeline-mongo-s3
+
+Clone the repository above and use the script path as the Jenkinsfile location.

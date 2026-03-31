@@ -1,0 +1,238 @@
+import groovy.json.JsonSlurper
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+
+    environment {
+        PHOME = '${WORKSPACE}'
+        PARAM_PATH = "${WORKSPACE}/params"
+        PARMFILE = "parm.json"
+        REVERTFILE = "${WORKSPACE}/revert.json"
+    }
+
+    stages {
+        stage('Check Approval Status') {
+            steps {
+                script {
+                    def jobType = "OOPC0001"
+                    def apiUrl = "https://jenkins.nonprod.webserver.insulet.com/approval/get_next_job.php?type=${jobType}"
+                    def jobNumberRaw = sh(
+                        script: "curl -s -k '${apiUrl}' | sed '/^\\s*\$/d'",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "API response (filtered): '${jobNumberRaw}'"
+
+                    if (!jobNumberRaw) {
+                        error "No job available for type ${jobType}. Skipping execution."
+
+                    }
+
+                    def jobNumber = jobNumberRaw.toInteger()
+                    echo "Valid job number received: ${jobNumber}"
+
+                    env.JOB_ID = jobNumber.toString()
+                }
+            }
+        }
+
+        stage('Fetch Parameters from Job File') {
+            steps {
+                script {
+                    def jobFilePath = sh(script: "mktemp", returnStdout: true).trim()
+                    def fetchUrl = "https://jenkins.nonprod.webserver.insulet.com/approval/fetch_job_file.php?jobid=${env.JOB_ID}"
+
+                    echo "📄 Fetching jobfile from ${fetchUrl}"
+                    echo "📄 Temp job file path: ${jobFilePath}"
+
+                    sh """
+                        curl -sk '${fetchUrl}' -o '${jobFilePath}'
+                    """
+
+                    def lines = readFile(jobFilePath).readLines()
+                    for (line in lines) {
+                        line = line.trim()
+                        if (line.startsWith("#") || line.isEmpty()) continue
+                        def (key, value) = line.tokenize("=")
+                        key = key?.trim()?.toUpperCase()
+                        value = value?.trim()?.replaceAll(/^"|"$/, '')
+                        if (key && value) {
+                            echo "Setting env: ${key}=${value}"
+                            env."${key}" = value
+                        }
+                    }
+
+                    sh "rm -f '${jobFilePath}'"
+                }
+            }
+        }  
+        stage('Get Existing Parameters') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+                    def awsRegion = retList[0] 
+                    sh """
+                        aws cloudformation describe-stacks --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --query 'Stacks[0].Parameters' > ${REVERTFILE}
+                        echo "<br>Parameter has been changed from : <br>" > mailfile.txt
+                        aws cloudformation describe-stacks --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --query 'Stacks[0].Parameters' | grep -w -A 1 ${env.PARAMETER_KEY} >> mailfile.txt
+                    """
+                }
+            }
+        }
+        
+        stage('Create Parameter File') {
+            steps {
+                script {
+                    def revertJson = readFile("${REVERTFILE}")
+                    def parameters = new groovy.json.JsonSlurperClassic().parseText(revertJson)
+
+                    def ParameterKey = env.PARAMETER_KEY ?: error("Parameter Key parameter is not defined")
+                    def ParameterValue = env.PARAMETER_VALUE ?: error("Parameter Value parameter is not defined")
+
+                    // Initialize a map to hold the parameters for easy lookup and modification
+                    def paramMap = [:]
+
+                    // Populate the map with existing parameters
+                    parameters.each { param ->
+                        paramMap[param.ParameterKey] = param.ParameterValue
+                    }
+
+                    // Update the parameter if it exists, otherwise add it
+                    paramMap[ParameterKey] = ParameterValue
+
+                    // Convert the map back to the list format required for the JSON
+                    def formattedParams = paramMap.collect { key, value ->
+                        [ParameterKey: key, ParameterValue: value]
+                    }
+
+                    def updatedJson = new groovy.json.JsonBuilder(formattedParams).toPrettyString()
+                    writeFile file: "${WORKSPACE}/${env.STACK_NAME}.parm.json", text: updatedJson
+                    echo "Generated JSON for Parameter Change" 
+                }
+            }
+        }
+        
+        stage('Update Stack with Parameter File') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+                    def awsRegion = retList[0]
+                    sh """
+                        date
+                        aws cloudformation update-stack --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --use-previous-template --capabilities CAPABILITY_NAMED_IAM --parameters file://${WORKSPACE}/${STACK_NAME}.${PARMFILE}
+                        aws cloudformation wait stack-update-complete --region ${awsRegion} --profile ${awsProfile} --stack-name ${STACK_NAME}
+                    """
+                }
+            }
+        }
+        
+        stage('Check ECS Service Last Restart Time') {
+            steps {
+                script {
+                    def CLUSTER_NAME_CLEAN = "${CLUSTER_NAME}".replaceAll(",", "")
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+                    def awsRegion = retList[0]
+                    def serviceName = "${STACK_NAME}".replaceAll(/^(qa|test)-/, '')
+                    def taskArnsJson = sh(script: "aws ecs list-tasks --region ${awsRegion} --profile ${awsProfile} --cluster ${CLUSTER_NAME_CLEAN} --service-name ${serviceName} --query 'taskArns' --output json", returnStdout: true).trim()
+                    def taskArns = new groovy.json.JsonSlurperClassic().parseText(taskArnsJson)
+
+                    if (taskArns.size() == 0) {
+                        echo "No tasks found for ECS service ${serviceName} in cluster ${CLUSTER_NAME_CLEAN}."
+                        return
+                    }
+
+                    def tasksJson = sh(script: "aws ecs describe-tasks --region ${awsRegion} --profile ${awsProfile} --cluster ${CLUSTER_NAME_CLEAN} --tasks ${taskArns.join(' ')} --query 'tasks[].[taskArn,startedAt]' --output json", returnStdout: true).trim()
+                    def tasks = new groovy.json.JsonSlurperClassic().parseText(tasksJson)
+                    def mostRecentTask = tasks.sort { -it[1] }.first()
+
+                    if (mostRecentTask) {
+                        echo "Most recently started task ARN: ${mostRecentTask[0]}"
+                        echo "Started at: ${mostRecentTask[1]}"
+                    def isoDate = "${mostRecentTask[1]}"
+                    def parsedDate = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX").parse(isoDate)
+                    def epochMillis = parsedDate.time
+                    def epochSeconds = epochMillis / 1000 + 5
+                    
+                    echo "ISO 8601 date: ${isoDate}"
+                    echo "Epoch (Unix timestamp in milliseconds): ${epochMillis}"
+                    echo "Epoch (Unix timestamp in seconds): ${epochSeconds}"
+                        calculateAndActOnStackAge("${epochMillis}")
+                    } else {
+                        echo "Unable to determine the most recent task start time for ECS service ${serviceName}"
+                    }
+                }
+            }
+        }
+        stage('Create and email reminder to change in DynamoDB') {
+            steps {
+                script {
+                    sh '''
+                    rm -rf deploymenttemplatelibrary clouddeployment 
+                    git clone https://bitbucket.insulet.com/scm/cldops/clouddeployment.git
+                    git clone https://bitbucket.insulet.com/scm/cldops/deploymenttemplatelibrary.git
+                    cd deploymenttemplatelibrary
+                    git checkout develop
+                    cd ../clouddeployment/deploy-cloud
+                    git checkout develop
+                    mv templates templates-org
+                    ln -s ../../deploymenttemplatelibrary/templates .
+                    export RELEASE_TEMPLATES=../../deploymenttemplatelibrary
+                    export AWS_PROFILE=WAADS3ACCESS
+                    echo " <br><br> $PARAMETER_KEY <br> has been changed to: <br> $PARAMETER_VALUE <br> in $ENVIRONMENT $STACK_NAME <br>" >> ../../mailfile.txt
+                    echo "<br><br>Please contact Cloud Operations at cloudops@insulet.com for assistance <br>" >> ../../mailfile.txt
+                    cat ../../mailfile.txt
+                    echo "#!/bin/bash" > ../../email.sh
+                    echo "source lib/emaillib.sh" >> ../../email.sh
+                    echo "send_html_email "EmailSender-NoReply@omnipodapps.com" "$EMAIL" 'Jenkins Parameter change report ' ../../mailfile.txt" >> ../../email.sh
+                    chmod +x ../../email.sh
+                    ../../email.sh
+                    '''
+                }
+            }
+        }        
+	} 
+}
+
+def calculateAndActOnStackAge(String taskStartTime) {
+    if (taskStartTime == null || taskStartTime.isEmpty()) {
+        echo "Task start time is null or empty, skipping ECS service restart check. $taskStartTime "
+        return
+    }
+    def timestampMillis = Long.parseLong(taskStartTime)
+    def currentTimeMillis = System.currentTimeMillis()
+    def elapsedMillis = currentTimeMillis - timestampMillis
+    def elapsedMinutes = elapsedMillis / (1000 * 60)
+  		// useful for debuging
+		// echo "Current (milliseconds): ${currentTimeMillis}"    
+		// echo "Timestamp (milliseconds): ${timestampMillis}"
+		// echo "Elapsed Time (milliseconds): ${elapsedMillis}"
+		// echo "Elapsed Time (minutes): ${elapsedMinutes}"
+
+    echo "ECS service has been running since last deployment for $elapsedMinutes minutes."
+
+    if (elapsedMinutes > 10) {
+        echo "Restarting ECS service..."
+        def CLUSTER_NAME_CLEAN = "${CLUSTER_NAME}".replaceAll(",", "")
+        def serviceName = "${STACK_NAME}".replaceAll(/^(qa|test)-/, '')
+        def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+        def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+        def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+        def awsRegion = retList[0]        
+        sh """
+              aws ecs update-service --region ${awsRegion} --profile ${awsProfile} --cluster ${CLUSTER_NAME_CLEAN} --service ${serviceName} --force-new-deployment
+        """
+        echo "ECS service has been restarted."
+    } else {
+        echo "No need to restart ECS service as it has not been running for 10 minutes yet."
+    }
+}

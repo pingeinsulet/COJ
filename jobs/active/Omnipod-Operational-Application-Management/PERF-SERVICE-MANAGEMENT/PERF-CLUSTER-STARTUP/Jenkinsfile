@@ -1,0 +1,402 @@
+import groovy.json.JsonSlurper
+
+/**
+ * ECS Manual Startup - Restore by Job ID
+ *
+ * Fetches parameters from the approval API using a provided Job ID (from ecs-shutdown-direct)
+ * and restores ECS services, ASG settings, and MongoDB.
+ */
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+
+    parameters {
+        string(name: 'JOB_ID', defaultValue: '', description: 'Job ID from shutdown (returned by ecs-shutdown-direct). Required to fetch parameters and restore.')
+        booleanParam(name: 'DRYRUN', defaultValue: false, description: 'If checked, will not make changes but will print commands that would be executed.')
+    }
+
+    environment {
+        API_FETCH_FILE_URL = "https://jenkins.dev.webserver.insulet.com/approval/fetch_job_file.php"
+    }
+
+    stages {
+        stage('Fetch Job Parameters') {
+            steps {
+                script {
+                    if (!params.JOB_ID || params.JOB_ID.trim() == '') {
+                        error("JOB_ID parameter is required. Enter the Job ID returned by the shutdown pipeline.")
+                    }
+
+                    env.JOB_ID = params.JOB_ID.trim()
+                    env.HAS_JOB = 'true'
+
+                    def jobFilePath = sh(script: "mktemp", returnStdout: true).trim()
+                    def fetchUrl = "${env.API_FETCH_FILE_URL}?jobid=${env.JOB_ID}"
+
+                    echo ""
+                    echo "=========================================="
+                    echo "MANUAL STARTUP - STEP 1: FETCHING JOB FILE"
+                    echo "=========================================="
+                    echo "Job ID: ${env.JOB_ID}"
+                    echo "Fetch URL: ${fetchUrl}"
+                    echo ""
+
+                    if (params.DRYRUN) {
+                        echo "[DRYRUN] Fetching to validate Job ID..."
+                    }
+
+                    sh """
+                        curl -sk '${fetchUrl}' -o '${jobFilePath}'
+                    """
+
+                    def rawContent = readFile(jobFilePath)
+                    echo "Raw job file content:"
+                    echo "----------------------------------------"
+                    echo rawContent
+                    echo "----------------------------------------"
+                    echo ""
+
+                    def lines = rawContent.readLines()
+                    def serviceList = []
+
+                    for (line in lines) {
+                        line = line.trim()
+                        if (line.startsWith("#") || line.isEmpty()) continue
+
+                        def parts = line.tokenize("=")
+                        if (parts.size() < 2) continue
+
+                        def key = parts[0]?.trim()
+                        def value = parts.drop(1).join("=").trim()?.replaceAll(/^"|"$/, '')
+
+                        if (key && value) {
+                            echo "Setting env: ${key}=${value}"
+                            env."${key}" = value
+
+                            if (key.endsWith('_DESIRED_COUNT')) {
+                                def serviceName = key.replaceAll(/_DESIRED_COUNT$/, '')
+                                if (!serviceList.contains(serviceName)) {
+                                    serviceList.add(serviceName)
+                                }
+                            }
+                        }
+                    }
+
+                    sh "rm -f '${jobFilePath}'"
+
+                    if (!env.ENVIRONMENT || !env.CLUSTER_NAME) {
+                        error("Required parameters (ENVIRONMENT, CLUSTER_NAME) not found in job file. Check that Job ID ${env.JOB_ID} exists and is valid.")
+                    }
+
+                    env.SERVICE_LIST = serviceList.join(',')
+                    env.TOTAL_SERVICES = serviceList.size().toString()
+
+                    echo ""
+                    echo "=========================================="
+                    echo "LOADED PARAMETERS"
+                    echo "=========================================="
+                    echo "Environment: ${env.ENVIRONMENT}"
+                    echo "Cluster: ${env.CLUSTER_NAME}"
+                    echo "AWS Profile: ${env.AWS_PROFILE}"
+                    echo "AWS Region: ${env.AWS_REGION}"
+                    echo "MongoDB: ${env.MONGO_CLUSTER_NAME ?: 'Not configured'}"
+                    echo "Total Services: ${env.TOTAL_SERVICES}"
+                    echo "Services: ${env.SERVICE_LIST}"
+                    echo "=========================================="
+                }
+            }
+        }
+
+        stage('Unpause MongoDB Cluster') {
+            when {
+                expression {
+                    env.HAS_JOB == 'true' &&
+                    env.MONGO_CLUSTER_NAME &&
+                    env.MONGO_CLUSTER_NAME != '' &&
+                    env.MONGO_CLUSTER_NAME != 'NOT_CONFIGURED' &&
+                    !params.DRYRUN
+                }
+            }
+            steps {
+                withCredentials([string(credentialsId: 'client-auth-mongo-token', variable: 'M_CLIENT_AUTH')]) {
+                    script {
+                        echo ""
+                        echo "=========================================="
+                        echo "MANUAL STARTUP - STEP 2: UNPAUSE MONGODB"
+                        echo "=========================================="
+
+                        def MongoClusterVar = env.MONGO_CLUSTER_NAME.split(',')
+                        def MongoCluster = MongoClusterVar[0]
+                        def ProjectID = MongoClusterVar[1]
+                        def pauseState = 'false'
+
+                        echo "MongoCluster: ${MongoCluster}"
+                        echo "ProjectID: ${ProjectID}"
+                        echo "Action: UNPAUSE (paused = ${pauseState})"
+
+                        def apiResponse = sh(
+                            script: """
+                                curl --request POST \
+                                --url https://cloud.mongodb.com/api/oauth/token \
+                                --header 'accept: application/json' \
+                                --header 'cache-control: no-cache' \
+                                --header "authorization: Basic \${M_CLIENT_AUTH}" \
+                                --header 'content-type: application/x-www-form-urlencoded' \
+                                --data 'grant_type=client_credentials'
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (apiResponse.contains('"error"')) {
+                            error("Failed to obtain MongoDB OAuth token: ${apiResponse}")
+                        }
+
+                        def token = apiResponse.replaceFirst(/.*"access_token":"([^"]+)".*/, '$1')
+                        def tokenFile = sh(script: 'mktemp', returnStdout: true).trim()
+                        writeFile file: tokenFile, text: token
+
+                        try {
+                            sh(
+                                script: """
+                                    TOKEN=\$(cat ${tokenFile})
+                                    curl --include \
+                                    --header "Authorization: Bearer \$TOKEN" \
+                                    --header "Accept: application/vnd.atlas.2025-03-12+json" \
+                                    --header "Content-Type: application/json" \
+                                    -X PATCH "https://cloud.mongodb.com/api/atlas/v2/groups/${ProjectID}/clusters/${MongoCluster}" \
+                                    -d '{ "paused" : false }'
+                                """,
+                                returnStdout: true
+                            )
+                            echo "✓ MongoDB cluster unpause requested"
+                            sleep time: 10, unit: 'SECONDS'
+                            echo "Waiting for MongoDB cluster to be fully ready..."
+                            sleep time: 30, unit: 'SECONDS'
+                            echo "✓ MongoDB is ready for connections"
+                        } finally {
+                            sh "rm -f '${tokenFile}'"
+                        }
+
+                        echo "=========================================="
+                    }
+                }
+            }
+        }
+
+        stage('Restore ECS Service Desired Counts') {
+            when {
+                expression { env.HAS_JOB == 'true' && env.SERVICE_LIST }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "MANUAL STARTUP - STEP 3: RESTORING ECS SERVICE DESIRED COUNTS"
+                    echo "=========================================="
+                    echo "Environment: ${env.ENVIRONMENT}"
+                    echo "Cluster: ${env.CLUSTER_NAME}"
+                    echo "AWS Profile: ${env.AWS_PROFILE}"
+                    echo "AWS Region: ${env.AWS_REGION}"
+                    echo ""
+
+                    def services = env.SERVICE_LIST.split(',')
+                    def successCount = 0
+                    def skipCount = 0
+                    def errorCount = 0
+
+                    for (def serviceName in services) {
+                        if (!serviceName || serviceName.trim() == '') continue
+
+                        echo "\n----------------------------------------"
+                        echo "Restoring Service: ${serviceName}"
+                        echo "----------------------------------------"
+
+                        def desiredCount = env."${serviceName}_DESIRED_COUNT"
+
+                        if (!desiredCount) {
+                            echo "⚠ No desired count found for ${serviceName}, skipping"
+                            skipCount++
+                            continue
+                        }
+
+                        echo "  Target Desired Count: ${desiredCount}"
+
+                        try {
+                            def updateCommand = """aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} ecs update-service --cluster ${env.CLUSTER_NAME} --service ${serviceName} --desired-count ${desiredCount}"""
+                            if (params.DRYRUN) {
+                                echo "[DRYRUN] Would execute: ${updateCommand}"
+                            } else {
+                                sh(script: updateCommand, returnStdout: true)
+                            }
+                            echo "  ✓ Service desired count restored to ${desiredCount}"
+                            successCount++
+                        } catch (Exception e) {
+                            echo "  ✗ Error restoring service ${serviceName}: ${e.message}"
+                            errorCount++
+                        }
+                    }
+
+                    echo "\n=========================================="
+                    echo "SERVICE RESTORATION SUMMARY"
+                    echo "=========================================="
+                    echo "✓ Successful: ${successCount}"
+                    echo "⊘ Skipped: ${skipCount}"
+                    echo "✗ Errors: ${errorCount}"
+                    echo "=========================================="
+                }
+            }
+        }
+
+        stage('Restore ASG Settings') {
+            when {
+                expression { env.HAS_JOB == 'true' && env.SERVICE_LIST }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "MANUAL STARTUP - STEP 4: RESTORING AUTO SCALING SETTINGS"
+                    echo "=========================================="
+
+                    def services = env.SERVICE_LIST.split(',')
+                    def successCount = 0
+                    def skipCount = 0
+                    def errorCount = 0
+
+                    for (def serviceName in services) {
+                        if (!serviceName || serviceName.trim() == '') continue
+
+                        def asgEnabled = env."${serviceName}_AUTOSCALING_ENABLED"
+                        if (asgEnabled != 'true') {
+                            skipCount++
+                            continue
+                        }
+
+                        def minCapacity = env."${serviceName}_AUTOSCALING_MIN"
+                        def maxCapacity = env."${serviceName}_AUTOSCALING_MAX"
+                        def roleArn = env."${serviceName}_AUTOSCALING_ROLE"
+                        def scalableDimension = env."${serviceName}_AUTOSCALING_SCALABLE_DIMENSION" ?: 'ecs:service:DesiredCount'
+
+                        if (!minCapacity || !maxCapacity || !roleArn) {
+                            echo "⚠ Missing required ASG parameters for ${serviceName}, skipping"
+                            skipCount++
+                            continue
+                        }
+
+                        echo "\nASG for: ${serviceName} (min=${minCapacity}, max=${maxCapacity})"
+
+                        try {
+                            def asgCommand = """aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} application-autoscaling register-scalable-target --service-namespace ecs --resource-id service/${env.CLUSTER_NAME}/${serviceName} --scalable-dimension ${scalableDimension} --min-capacity ${minCapacity} --max-capacity ${maxCapacity} --role-arn ${roleArn}"""
+                            if (params.DRYRUN) {
+                                echo "[DRYRUN] Would execute: ${asgCommand}"
+                            } else {
+                                sh(script: asgCommand, returnStdout: true)
+                            }
+                            successCount++
+                        } catch (Exception e) {
+                            echo "  ✗ Error: ${e.message}"
+                            errorCount++
+                        }
+                    }
+
+                    echo "\nASG restoration: ✓ ${successCount} ⊘ ${skipCount} ✗ ${errorCount}"
+                    echo "=========================================="
+                }
+            }
+        }
+
+        stage('Verify Restoration') {
+            when {
+                expression { env.HAS_JOB == 'true' && env.SERVICE_LIST && !params.DRYRUN }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "MANUAL STARTUP - STEP 5: VERIFYING RESTORATION"
+                    echo "=========================================="
+
+                    def services = env.SERVICE_LIST.split(',')
+
+                    for (def serviceName in services) {
+                        if (!serviceName || serviceName.trim() == '') continue
+
+                        echo "\n${serviceName}:"
+
+                        try {
+                            def currentDesired = sh(
+                                script: """
+                                    aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} \
+                                    ecs describe-services --cluster ${env.CLUSTER_NAME} --services ${serviceName} \
+                                    --query 'services[0].desiredCount' --output text
+                                """,
+                                returnStdout: true
+                            ).trim()
+
+                            def currentRunning = sh(
+                                script: """
+                                    aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} \
+                                    ecs describe-services --cluster ${env.CLUSTER_NAME} --services ${serviceName} \
+                                    --query 'services[0].runningCount' --output text
+                                """,
+                                returnStdout: true
+                            ).trim()
+
+                            def expectedDesired = env."${serviceName}_DESIRED_COUNT"
+                            echo "  Expected Desired: ${expectedDesired}"
+                            echo "  Current Desired:  ${currentDesired}"
+                            echo "  Current Running:  ${currentRunning}"
+                            echo "  ${currentDesired == expectedDesired ? '✓ Match!' : '✗ Mismatch!'}"
+                        } catch (Exception e) {
+                            echo "  ✗ Error: ${e.message}"
+                        }
+                    }
+
+                    echo "\n=========================================="
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                def dryrunPrefix = params.DRYRUN ? "[DRYRUN] " : ""
+                echo ""
+                echo "=========================================="
+                echo "MANUAL STARTUP COMPLETED SUCCESSFULLY"
+                echo "=========================================="
+                echo "${dryrunPrefix}✓ Parameters fetched from Job ID: ${env.JOB_ID}"
+                echo "${dryrunPrefix}✓ ECS services restored"
+                if (env.MONGO_CLUSTER_NAME && env.MONGO_CLUSTER_NAME != 'NOT_CONFIGURED') {
+                    echo "${dryrunPrefix}✓ MongoDB cluster unpaused"
+                }
+                echo ""
+                echo "Environment: ${env.ENVIRONMENT}"
+                echo "Cluster: ${env.CLUSTER_NAME}"
+                echo "Services: ${env.SERVICE_LIST}"
+                echo "=========================================="
+            }
+        }
+
+        failure {
+            echo ""
+            echo "=========================================="
+            echo "MANUAL STARTUP FAILED"
+            echo "=========================================="
+            echo "✗ Check the logs above for details"
+            echo "  Job ID: ${env.JOB_ID}"
+            echo "=========================================="
+        }
+
+        aborted {
+            echo ""
+            echo "=========================================="
+            echo "MANUAL STARTUP ABORTED"
+            echo "=========================================="
+        }
+    }
+}

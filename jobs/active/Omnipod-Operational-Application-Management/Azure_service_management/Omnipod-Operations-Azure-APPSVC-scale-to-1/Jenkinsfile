@@ -1,0 +1,147 @@
+import groovy.json.JsonSlurper
+import java.net.URLDecoder
+
+/**
+ * Azure Nightly App Service Plan Scale (P2v3 ↔ B1)
+ *
+ * Scales App Service Plans tagged with AutoStopPolicy=test:
+ * - down: P2v3 → B1 (1 worker) — run with autostop (e.g. cron: 0 2 * * *)
+ * - up:   B1 → P2v3 (1 worker) — run with autostart (e.g. cron: 0 6 * * *)
+ *
+ * One service principal (Jenkins credentials below). ACCOUNT is a string (subscription name or GUID) for az account set.
+ * Optional SUBSCRIPTION overrides ACCOUNT when set (e.g. GUID in cron while default display name in ACCOUNT).
+ * Parameterized cron: encode spaces in ACCOUNT as %20; encode = in TAG as %3D (e.g. AutoStopPolicy%3Dweekend).
+ *
+ * Parameterized cron example (note TAG: encode = as %3D so the line is not split on the second equals):
+ *   * * * * * %ACCOUNT=db0f4822-b2cc-469e-abf5-b9b3ed6647cc;SCALE_MODE=down;TAG=AutoStopPolicy%3Dweekend;SKU_DOWN=B1;SKU_UP=P2v3
+ */
+pipeline {
+    agent { label 'jenkins-agent' }
+
+    parameters {
+        string(
+            name: 'ACCOUNT',
+            defaultValue: 'Insulet US - DMS Dev',
+            description: 'Subscription name or GUID (string). Use in parameterized cron as %ACCOUNT=... (GUID or %20 for spaces). Required unless SKIP_AZ_LOGIN.'
+        )
+        string(
+            name: 'SUBSCRIPTION',
+            defaultValue: '',
+            description: 'Optional. Subscription name or ID; overrides decoded ACCOUNT when non-empty (e.g. set from cron).'
+        )
+        choice(name: 'SCALE_MODE', choices: ['down', 'up'], description: 'down: P2v3→B1 | up: B1→P2v3')
+        string(name: 'TAG', defaultValue: 'AutoStopPolicy=test', description: 'Tag filter (key=value). In parameterized cron use %3D for = in value, e.g. TAG=AutoStopPolicy%3Dweekend')
+        string(name: 'SKU_DOWN', defaultValue: 'B1', description: 'SKU when scaling down.')
+        string(name: 'SKU_UP', defaultValue: 'P2v3', description: 'SKU when scaling up.')
+        booleanParam(name: 'DRYRUN', defaultValue: false, description: 'List only; no scale.')
+        booleanParam(name: 'SKIP_AZ_LOGIN', defaultValue: false, description: 'Skip login (managed identity).')
+    }
+
+    stages {
+        stage('Azure Login') {
+            when { expression { !params.SKIP_AZ_LOGIN } }
+            steps {
+                withCredentials([
+                    string(credentialsId: 'azure-ad-tenant-id', variable: 'AZURE_TENANT_ID'),
+                    string(credentialsId: 'azure-ad-client-id', variable: 'AZURE_CLIENT_ID'),
+                    string(credentialsId: 'azure-ad-client-secret', variable: 'AZURE_CLIENT_SECRET')
+                ]) {
+                    script {
+                        def raw = params.ACCOUNT?.trim()
+                        if (!raw) {
+                            error('ACCOUNT is required, or enable SKIP_AZ_LOGIN if already authenticated.')
+                        }
+                        if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+                            raw = raw.substring(1, raw.length() - 1)
+                        }
+                        def fromAccount = raw.contains('%') ? URLDecoder.decode(raw, 'UTF-8') : raw
+                        def effectiveSub = params.SUBSCRIPTION?.trim() ?: fromAccount
+                        echo "Azure subscription: ${effectiveSub} (${params.SUBSCRIPTION?.trim() ? 'from SUBSCRIPTION' : 'from ACCOUNT'})"
+                        sh '''
+                            az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output none
+                        '''
+                        sh "az account set -s \"${effectiveSub}\""
+                    }
+                    sh 'az account show -o table'
+                }
+            }
+        }
+
+        stage('Scale App Service Plans') {
+            steps {
+                script {
+                    // Cron: TAG=AutoStopPolicy=weekend breaks Parameterized Scheduler (extra '='). Use TAG=AutoStopPolicy%3Dweekend.
+                    def tagParam = params.TAG?.trim() ?: ''
+                    if (tagParam.contains('%')) {
+                        tagParam = URLDecoder.decode(tagParam, 'UTF-8')
+                    }
+                    def tagParts = tagParam.split('=', 2)
+                    def tagKey = tagParts[0]?.trim() ?: 'AutoStopPolicy'
+                    def tagValue = tagParts.size() > 1 ? tagParts[1].trim() : 'test'
+
+                    def sku = params.SCALE_MODE == 'down' ? params.SKU_DOWN : params.SKU_UP
+                    def workers = 1
+
+                    if (params.DRYRUN) {
+                        echo "DRYRUN: Listing App Service Plans with tag ${tagKey}=${tagValue} (would scale ${params.SCALE_MODE} → ${sku}, ${workers} worker)"
+                    }
+
+                    // az resource list --tag is unreliable; fetch all serverfarms and filter by tag client-side
+                    def allJson = sh(
+                        script: "az resource list --resource-type Microsoft.Web/serverfarms --query \"[].{id:id,name:name,resourceGroup:resourceGroup,tags:tags}\" -o json",
+                        returnStdout: true
+                    ).trim()
+
+                    // Convert to plain types immediately (avoids NotSerializableException: LazyMap when agent goes offline)
+                    def allPlans = (allJson && allJson != '[]') ? {
+                        def parsed = new JsonSlurper().parseText(allJson)
+                        if (!(parsed instanceof List)) parsed = [parsed]
+                        return parsed.collect { p ->
+                            def tags = p.tags ? new HashMap(p.tags.collectEntries { k, v -> [(k.toString()): v.toString()] }) : null
+                            [id: p.id?.toString(), name: p.name?.toString(), resourceGroup: p.resourceGroup?.toString(), tags: tags]
+                        }
+                    }.call() : []
+
+                    def plans = allPlans.findAll { it.tags && it.tags[tagKey] == tagValue }
+                        .collect { [id: it.id, name: it.name, resourceGroup: it.resourceGroup] }
+
+                    if (!plans || plans.size() == 0) {
+                        echo "No App Service Plans found with tag ${tagKey}=${tagValue}"
+                        echo ""
+                        echo "--- Diagnostic: all App Service Plans with tags ---"
+                        allPlans.each { p ->
+                            def tagStr = p.tags ? p.tags.collect { k, v -> "${k}=${v}" }.join(', ') : '(none)'
+                            echo "  ${p.name} | ${p.resourceGroup} | ${tagStr}"
+                        }
+                        return
+                    }
+
+                    echo "Found ${plans.size()} App Service Plan(s)"
+                    plans.each { echo "  ${it.name} (${it.resourceGroup})" }
+
+                    if (!params.DRYRUN) {
+                        def failedPlans = []
+                        plans.each { plan ->
+                            def rc = sh(
+                                script: "az appservice plan update --resource-group '${plan.resourceGroup}' --name '${plan.name}' --sku '${sku}' --number-of-workers ${workers}",
+                                returnStatus: true
+                            )
+                            if (rc == 0) {
+                                echo "  ✓ Scaled ${plan.name} to ${sku} (${workers} worker)"
+                            } else {
+                                echo "  ✗ FAILED ${plan.name} (${plan.resourceGroup}) — az exit ${rc}; see log above. Continuing with remaining plans."
+                                failedPlans << "${plan.name} (${plan.resourceGroup})"
+                            }
+                        }
+                        if (failedPlans) {
+                            echo ""
+                            echo "--- Summary: ${failedPlans.size()} plan(s) failed ---"
+                            failedPlans.each { echo "  - ${it}" }
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

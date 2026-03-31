@@ -1,0 +1,337 @@
+#!/usr/bin/env groovy
+
+/**
+ * Panic Button Pipeline
+ * 
+ * This pipeline polls for approved PANB0001 job types (panic button activation).
+ * When a PANB0001 job is approved, it fetches the job file which contains the
+ * job ID to cancel, then cancels that specific job.
+ * 
+ * Workflow:
+ * 1. PANB0001 job is created with a job file containing only the job_id number
+ * 2. When PANB0001 gets approved, this pipeline:
+ *    - Finds the approved PANB0001 job
+ *    - Fetches the PANB0001 job file
+ *    - Extracts the job_id from the file (just a number)
+ *    - Cancels that specific job (generic - works for any job type)
+ * 
+ * Setup Instructions:
+ * 1. Create a new Jenkins Pipeline job
+ * 2. Configure "Pipeline script from SCM" or paste this script
+ * 3. Enable SCM polling (recommended: every 1-5 minutes)
+ * 4. The pipeline will automatically check for approved PANB0001 and cancel the specified job
+ */
+
+pipeline {
+    agent {
+        label 'jenkins-agent'
+    }
+    
+    options {
+        // Keep only last 20 builds
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        // Allow concurrent builds (multiple checks can run simultaneously)
+        // disableConcurrentBuilds()
+        // Timeout after 10 minutes
+        timeout(time: 10, unit: 'MINUTES')
+    }
+    
+    triggers {
+        // Poll SCM every 5 minutes
+        // Format: minute hour day-of-month month day-of-week
+        // H/5 = every 5 minutes (H for hash/distributed load)
+        // Adjust as needed: H/1 = every minute, H/2 = every 2 minutes, etc.
+        pollSCM('H/5 * * * *')
+    }
+    
+    environment {
+        PANIC_BUTTON_TYPE = "PANB0001"
+        API_GET_JOB_URL = "http://jenkins.dev.webserver.insulet.com/approval/get_next_job.php"
+        API_FETCH_FILE_URL = "http://jenkins.dev.webserver.insulet.com/approval/fetch_job_file.php"
+        API_UPDATE_STATUS_URL = "http://jenkins.dev.webserver.insulet.com/approval/update_stat.php"
+    }
+    
+    stages {
+        stage('Check for Panic Button Activation') {
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "PANIC BUTTON - JOB CANCELLATION CHECK"
+                    echo "=========================================="
+                    echo "Checking for panic button (${env.PANIC_BUTTON_TYPE}) activation..."
+                    echo "Timestamp: ${new Date().format('yyyy-MM-dd HH:mm:ss')}"
+                    echo ""
+                    
+                    // Query for PANB0001 jobs (panic button)
+                    def apiUrl = "${env.API_GET_JOB_URL}?type=${env.PANIC_BUTTON_TYPE}"
+                    echo "Querying for panic button: ${apiUrl}"
+                    
+                    def panicJobIdRaw = sh(
+                        script: "curl -s -k '${apiUrl}' | sed '/^\\s*\$/d'",
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "API response: '${panicJobIdRaw}'"
+                    echo ""
+                    
+                    // Check if we got a valid panic button job ID
+                    if (!panicJobIdRaw || panicJobIdRaw == '' || panicJobIdRaw == 'NONE' || !panicJobIdRaw.matches('\\d+')) {
+                        echo "✓ No panic button activation found"
+                        echo "✓ Exiting pipeline - no action required"
+                        echo ""
+                        echo "No action required - scheduled jobs can continue running"
+                        echo ""
+                        // Mark that API did not respond with a valid job
+                        env.API_RESPONDED = 'false'
+                        currentBuild.result = 'ABORTED'
+                        return
+                    }
+                    
+                    // Panic button activated - store the PANB0001 job ID
+                    echo "⚠ PANIC BUTTON ACTIVATED!"
+                    echo "Panic button job ID: ${panicJobIdRaw}"
+                    echo ""
+                    
+                    // Mark that API responded with a valid job
+                    env.API_RESPONDED = 'true'
+                    env.PANIC_BUTTON_JOB_ID = panicJobIdRaw
+                    env.PANIC_BUTTON_FOUND = 'true'
+                }
+            }
+        }
+        
+        stage('Fetch Job File and Extract Job ID') {
+            when {
+                expression { env.PANIC_BUTTON_FOUND == 'true' }
+            }
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "FETCHING PANB0001 JOB FILE"
+                    echo "=========================================="
+                    echo "PANB0001 Job ID: ${env.PANIC_BUTTON_JOB_ID}"
+                    echo ""
+                    
+                    // Fetch the PANB0001 job file
+                    def jobFilePath = sh(script: "mktemp", returnStdout: true).trim()
+                    def fetchUrl = "${env.API_FETCH_FILE_URL}?jobid=${env.PANIC_BUTTON_JOB_ID}"
+                    
+                    echo "Fetching job file from: ${fetchUrl}"
+                    echo "Temp file path: ${jobFilePath}"
+                    echo ""
+                    
+                    sh """
+                        curl -sk '${fetchUrl}' -o '${jobFilePath}'
+                    """
+                    
+                    // Read and parse the job file
+                    def rawContent = readFile(jobFilePath)
+                    echo "Job file content:"
+                    echo "----------------------------------------"
+                    echo rawContent
+                    echo "----------------------------------------"
+                    echo ""
+                    
+                    // Extract job_id - the file should contain just a number
+                    // Try to find a number in the file (could be on its own line or as job_id=number)
+                    def jobIdToCancel = null
+                    def lines = rawContent.readLines()
+                    
+                    for (line in lines) {
+                        line = line.trim()
+                        if (line.isEmpty() || line.startsWith("#")) continue
+                        
+                        // Check if line is just a number
+                        if (line.matches('\\d+')) {
+                            jobIdToCancel = line
+                            break
+                        }
+                        
+                        // Check if line is in key=value format (e.g., job_id=12345)
+                        if (line.contains('=')) {
+                            def parts = line.split('=', 2)
+                            def key = parts[0]?.trim()
+                            def value = parts[1]?.trim()?.replaceAll(/^"|"$/, '')
+                            
+                            if ((key == 'job_id' || key == 'JOB_ID') && value?.matches('\\d+')) {
+                                jobIdToCancel = value
+                                break
+                            }
+                        }
+                    }
+                    
+                    // Clean up temp file
+                    sh "rm -f '${jobFilePath}'"
+                    
+                    if (!jobIdToCancel || !jobIdToCancel.matches('\\d+')) {
+                        error("Could not extract valid job_id from PANB0001 job file. File content: ${rawContent}")
+                    }
+                    
+                    echo "✓ Extracted job ID to cancel: ${jobIdToCancel}"
+                    echo ""
+                    
+                    env.JOB_ID_TO_CANCEL = jobIdToCancel
+                }
+            }
+        }
+        
+        stage('Cancel Job') {
+            when {
+                expression { env.JOB_ID_TO_CANCEL != null && env.JOB_ID_TO_CANCEL != '' }
+            }
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "CANCELLING JOB"
+                    echo "=========================================="
+                    echo "Job ID to cancel: ${env.JOB_ID_TO_CANCEL}"
+                    echo ""
+                    
+                    // Cancel the job using update_stat.php
+                    def cancelUrl = "${env.API_UPDATE_STATUS_URL}?id=${env.JOB_ID_TO_CANCEL}&status=CANCELLED"
+                    echo "Calling: ${cancelUrl}"
+                    
+                    def cancelResponse = sh(
+                        script: "curl -s -w -k -X GET '${cancelUrl}'",
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "Response: '${cancelResponse}'"
+                    echo ""
+                    
+                    if (cancelResponse == 'OK' || cancelResponse.contains('OK')) {
+                        echo "✓ Job ${env.JOB_ID_TO_CANCEL} successfully cancelled"
+                        echo "✓ Scheduled job has been stopped"
+                        env.CANCELLATION_SUCCESS = 'true'
+                    } else {
+                        echo "⚠ Warning: Unexpected response from cancellation API"
+                        echo "Response was: '${cancelResponse}'"
+                        echo "Job may or may not have been cancelled - please verify"
+                        env.CANCELLATION_SUCCESS = 'false'
+                    }
+                    
+                    echo ""
+                    echo "=========================================="
+                    echo "PANIC BUTTON ACTIVATED"
+                    echo "=========================================="
+                    echo "Job ${env.JOB_ID_TO_CANCEL} has been cancelled"
+                    echo "Scheduled job should now be stopped"
+                    echo ""
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                echo ""
+                echo "=========================================="
+                echo "✅ PANIC BUTTON CHECK COMPLETED"
+                echo "=========================================="
+                if (env.PANIC_BUTTON_FOUND == 'true') {
+                    if (env.CANCELLATION_SUCCESS == 'true') {
+                        echo "Panic button activated - job ${env.JOB_ID_TO_CANCEL} was cancelled"
+                    } else {
+                        echo "Panic button activated - cancellation may have failed (check logs)"
+                    }
+                } else {
+                    echo "No panic button activation found - no action taken"
+                }
+                echo "Timestamp: ${new Date().format('yyyy-MM-dd HH:mm:ss')}"
+                echo "=========================================="
+                echo ""
+            }
+        }
+        
+        failure {
+            script {
+                echo ""
+                echo "=========================================="
+                echo "❌ PANIC BUTTON CHECK FAILED"
+                echo "=========================================="
+                echo "Build Number: ${env.BUILD_NUMBER}"
+                echo "Check the logs above for details"
+                echo "=========================================="
+                echo ""
+            }
+        }
+        
+        aborted {
+            script {
+                echo ""
+                echo "=========================================="
+                echo "⊘ PANIC BUTTON CHECK - NO JOB FOUND"
+                echo "=========================================="
+                echo "No panic button activation - build marked as cancelled"
+                echo "Timestamp: ${new Date().format('yyyy-MM-dd HH:mm:ss')}"
+                echo "=========================================="
+                echo ""
+            }
+        }
+        
+        always {
+            script {
+                echo ""
+                echo "Build completed at: ${new Date().format('yyyy-MM-dd HH:mm:ss')}"
+                
+                // Delete build if API did not respond with a valid job
+                if (env.API_RESPONDED != 'true') {
+                    echo ""
+                    echo "=========================================="
+                    echo "DELETING BUILD - NO API RESPONSE"
+                    echo "=========================================="
+                    echo "API did not return a valid response (returned 'NONE' or empty)"
+                    echo "Deleting this build to keep only builds with API responses"
+                    echo ""
+                    
+                    try {
+                        // Use Jenkins REST API to delete the build (safer than Jenkins.instance)
+                        def jenkinsUrl = env.JENKINS_URL ?: 'http://localhost:8080'
+                        // Handle job names with folders (e.g., folder/job becomes folder/job/job)
+                        def jobPath = env.JOB_NAME.replaceAll('%2F', '/').split('/').collect { it }.join('/job/')
+                        def buildNumber = env.BUILD_NUMBER
+                        
+                        // Construct the delete URL for Jenkins REST API
+                        def deleteUrl = "${jenkinsUrl}/job/${jobPath}/${buildNumber}/doDelete"
+                        
+                        echo "Deleting build via REST API..."
+                        echo "URL: ${deleteUrl}"
+                        
+                        // Use curl to call Jenkins REST API
+                        // This method doesn't require script security approval
+                        def deleteResult = sh(
+                            script: """
+                                curl -X POST -f -s \
+                                    --user \${JENKINS_USER}:\${JENKINS_API_TOKEN} \
+                                    '${deleteUrl}' 2>&1 || \
+                                curl -X POST -f -s \
+                                    --cookie-jar /tmp/jenkins_cookies.txt \
+                                    --cookie /tmp/jenkins_cookies.txt \
+                                    '${deleteUrl}' 2>&1 || \
+                                echo "Deletion requires authentication"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (deleteResult && !deleteResult.contains('requires authentication') && !deleteResult.contains('401') && !deleteResult.contains('403')) {
+                            echo "✓ Build #${buildNumber} deletion requested successfully"
+                        } else {
+                            echo "⚠ Build deletion requires authentication"
+                            echo "Configure JENKINS_USER and JENKINS_API_TOKEN environment variables"
+                            echo "Or manually delete build #${buildNumber} at: ${jenkinsUrl}/job/${jobPath}/${buildNumber}/"
+                        }
+                    } catch (Exception e) {
+                        echo "⚠ Warning: Could not delete build automatically: ${e.message}"
+                        echo "Build #${env.BUILD_NUMBER} will be retained"
+                        echo ""
+                        echo "To enable automatic deletion:"
+                        echo "  1. Set JENKINS_USER and JENKINS_API_TOKEN environment variables"
+                        echo "  2. Or manually delete the build from Jenkins UI"
+                    }
+                }
+            }
+        }
+    }
+}

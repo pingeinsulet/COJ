@@ -1,0 +1,86 @@
+import groovy.json.JsonSlurper
+
+/**
+ * Azure Nightly Auto-Stop
+ *
+ * Deallocates VMs tagged with AutoStopPolicy=test.
+ * Schedule to run nightly (e.g. cron: 0 2 * * * for 2 AM).
+ *
+ * Prerequisites: Azure CLI (az), service principal or managed identity.
+ */
+pipeline {
+    agent { label 'jenkins-agent' }
+
+    environment {
+        PATH = "${env.HOME}/bin:${env.PATH}"
+    }
+
+    parameters {
+        string(name: 'SUBSCRIPTION', defaultValue: 'Insulet US - DMS Dev', description: 'Azure subscription name or ID.')
+        string(name: 'TAG', defaultValue: 'AutoStopPolicy=test', description: 'Tag filter (key=value).')
+        booleanParam(name: 'DRYRUN', defaultValue: false, description: 'List only; no deallocate.')
+        booleanParam(name: 'SKIP_AZ_LOGIN', defaultValue: false, description: 'Skip login (managed identity).')
+    }
+
+    stages {
+        stage('Azure Login') {
+            when { expression { !params.SKIP_AZ_LOGIN } }
+            steps {
+                withCredentials([
+                    string(credentialsId: 'azure-ad-tenant-id', variable: 'AZURE_TENANT_ID'),
+                    string(credentialsId: 'azure-ad-client-id', variable: 'AZURE_CLIENT_ID'),
+                    string(credentialsId: 'azure-ad-client-secret', variable: 'AZURE_CLIENT_SECRET')
+                ]) {
+                    sh '''
+                        export PATH="$HOME/bin:$PATH"
+                        az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output none
+                    '''
+                    sh "export PATH=\"\$HOME/bin:\$PATH\" && az account set -s \"${params.SUBSCRIPTION}\""
+                    sh 'export PATH="$HOME/bin:$PATH" && az account show -o table'
+                }
+            }
+        }
+
+        stage('Deallocate VMs') {
+            steps {
+                script {
+                    def tagParts = params.TAG.split('=', 2)
+                    def tagKey = tagParts[0]?.trim() ?: 'AutoStopPolicy'
+                    def tagValue = tagParts.size() > 1 ? tagParts[1].trim() : 'test'
+
+                    if (params.DRYRUN) {
+                        echo "DRYRUN: Listing VMs with tag ${tagKey}=${tagValue}"
+                    }
+
+                    // az vm list with JMESPath - tags are in .tags object
+                    def vmIds = sh(
+                        script: "export PATH=\"\$HOME/bin:\$PATH\" && az vm list -d --query \"[?tags.${tagKey}=='${tagValue}'].id\" -o tsv",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!vmIds) {
+                        echo "No VMs found with tag ${tagKey}=${tagValue}"
+                        echo ""
+                        echo "--- Diagnostic: all VMs with name, resource group, tags ---"
+                        sh 'export PATH="$HOME/bin:$PATH" && az account show -o table'
+                        def vmJson = sh(script: 'export PATH="$HOME/bin:$PATH" && az vm list -d --query "[].{name:name, resourceGroup:resourceGroup, tags:tags}" -o json', returnStdout: true).trim()
+                        def vms = new JsonSlurper().parseText(vmJson)
+                        vms.each { vm ->
+                            def tagStr = vm.tags ? vm.tags.collect { k, v -> "${k}=${v}" }.join(', ') : '(none)'
+                            echo "  ${vm.name} | ${vm.resourceGroup} | ${tagStr}"
+                        }
+                        return
+                    }
+
+                    def count = vmIds.split(/\s+/).findAll { it }.size()
+                    echo "Found ${count} VM(s)"
+
+                    if (!params.DRYRUN) {
+                        sh "export PATH=\"\$HOME/bin:\$PATH\" && az vm deallocate --ids ${vmIds.replaceAll(/\s+/, ' ')}"
+                        echo "Deallocated."
+                    }
+                }
+            }
+        }
+    }
+}

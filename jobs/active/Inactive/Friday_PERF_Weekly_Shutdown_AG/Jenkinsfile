@@ -1,0 +1,265 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom 'jenkins-agent'
+        }
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['CloudOps_Sandbox-QA', 'RDHorizonDevCloud10x-PERF', 'RDHorizonQACloud-PERF', 'EU_RDHorizonPerfCloud-PERF'], description: 'Select AWS Environment')
+        choice(name: 'CLUSTER_NAME', choices: ['HRZ-QA', 'HRZ-PERF', 'HRZ-PERF10X'], description: 'Select ECS Cluster')
+        string(name: 'STACK_NAME', defaultValue: '', description: 'Stack Name (optional)')
+        string(name: 'MONGO_CLUSTER_NAME', defaultValue: '', description: 'MongoDB Cluster Name,Project ID (e.g., "MyCluster,507f1f77bcf86cd799439011")')
+        string(name: 'TEAMS_WEBHOOK', defaultValue: 'YOUR_WEBHOOK_URL', description: 'Teams Webhook URL for notifications')
+    }
+
+    environment {
+        Desc = "Weekend Shutdown Approval Request"
+        type = "PANB0001"
+        JOB_TYPE = "PANB0001"
+        API_URL = "http://jenkins.dev.webserver.insulet.com/approval/create_approval_job.php"
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "WEDNESDAY: WEEKEND SHUTDOWN APPROVAL REQUEST"
+                    echo "=========================================="
+                    echo "Requesting approval for weekend shutdown on Friday"
+                    echo ""
+                    echo "Environment: ${env.ENVIRONMENT}"
+                    echo "Cluster: ${env.CLUSTER_NAME}"
+                    echo "Stack: ${env.STACK_NAME ?: 'N/A'}"
+                    echo "MongoDB: ${env.MONGO_CLUSTER_NAME ?: 'Not configured'}"
+                    echo "=========================================="
+                    echo ""
+                    
+                    // Validate required parameters
+                    if (!env.ENVIRONMENT || env.ENVIRONMENT == '') {
+                        error("ENVIRONMENT parameter is required")
+                    }
+                    
+                    if (!env.CLUSTER_NAME || env.CLUSTER_NAME == '') {
+                        error("CLUSTER_NAME parameter is required")
+                    }
+                    
+                    // Validate MongoDB cluster name format if provided
+                    if (env.MONGO_CLUSTER_NAME && env.MONGO_CLUSTER_NAME != '') {
+                        def parts = env.MONGO_CLUSTER_NAME.split(',')
+                        if (parts.size() != 2) {
+                            error("MONGO_CLUSTER_NAME must be in format: ClusterName,ProjectID")
+                        }
+                        echo "✓ MongoDB cluster configuration validated"
+                    } else {
+                        echo "⚠ WARNING: No MongoDB cluster specified - MongoDB will NOT be paused"
+                    }
+                    
+                    // Derive AWS profile and region for storage
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|DEV|TEST|Test|INT|PERF|DEV2|ATMTEST|)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def awsRegion = new JsonSlurper().parseText(data)[0].toString()
+                    
+                    env.AWS_PROFILE = awsProfile
+                    env.AWS_REGION = awsRegion
+                    
+                    echo ""
+                    echo "✓ All parameters validated"
+                    echo "AWS Profile: ${awsProfile}"
+                    echo "AWS Region: ${awsRegion}"
+                    echo ""
+                    echo "Note: Service details will be captured on Friday when shutdown runs"
+                }
+            }
+        }
+
+        stage('Generate Approval Request') {
+            steps {
+                script {
+                    env.REQFILE = sh(script: "mktemp /tmp/agreq.XXXXXX.txt", returnStdout: true).trim()
+                    echo "Generated temp file: ${env.REQFILE}"
+                }
+            }
+        }
+
+        stage('Prepare Approval Request File') {
+            steps {
+                script {
+                    def fullName = "${BUILD_USER}"
+                    echo "Approval requested by: ${fullName}"
+
+                    def reqLines = []
+                    reqLines.add("# === Weekend Shutdown Approval Request ===")
+                    reqLines.add("# Requested: ${new Date().toString()}")
+                    reqLines.add("# Shutdown scheduled for: Friday Evening")
+                    reqLines.add("# Startup scheduled for: Sunday Morning")
+                    reqLines.add("")
+                    reqLines.add("# === Job Parameters Below ===")
+                    reqLines.add("AGuserid=\"${fullName}\"")
+                    reqLines.add("REQUEST_TYPE=WEEKEND_SHUTDOWN_APPROVAL")
+                    reqLines.add("ENVIRONMENT=${env.ENVIRONMENT}")
+                    reqLines.add("STACK_NAME=${env.STACK_NAME ?: 'N/A'}")
+                    reqLines.add("CLUSTER_NAME=${env.CLUSTER_NAME}")
+                    reqLines.add("AWS_PROFILE=${env.AWS_PROFILE}")
+                    reqLines.add("AWS_REGION=${env.AWS_REGION}")
+                    reqLines.add("MONGO_CLUSTER_NAME=${env.MONGO_CLUSTER_NAME ?: 'NOT_CONFIGURED'}")
+                    reqLines.add("")
+                    reqLines.add("# === What Will Happen on Friday ===")
+                    reqLines.add("# Friday Evening at 6:00 PM:")
+                    reqLines.add("#   1. Query and capture all ECS service parameters")
+                    reqLines.add("#   2. Capture all AutoScaling settings")
+                    reqLines.add("#   3. Shutdown all ECS services in ${env.CLUSTER_NAME}")
+                    if (env.MONGO_CLUSTER_NAME && env.MONGO_CLUSTER_NAME != '') {
+                        reqLines.add("#   4. Pause MongoDB cluster: ${env.MONGO_CLUSTER_NAME.split(',')[0]}")
+                    }
+                    reqLines.add("#")
+                    reqLines.add("# Sunday Morning at 6:00 AM:")
+                    if (env.MONGO_CLUSTER_NAME && env.MONGO_CLUSTER_NAME != '') {
+                        reqLines.add("#   1. Unpause MongoDB cluster")
+                        reqLines.add("#   2. Restore all ECS services to original state")
+                        reqLines.add("#   3. Restore all AutoScaling settings")
+                    } else {
+                        reqLines.add("#   1. Restore all ECS services to original state")
+                        reqLines.add("#   2. Restore all AutoScaling settings")
+                    }
+                    reqLines.add("")
+                    reqLines.add("# === Approval Required By ===")
+                    reqLines.add("APPROVAL_DEADLINE=Friday 4:00 PM")
+                    reqLines.add("AUTO_REJECT_IF_NO_RESPONSE=true")
+                    reqLines.add("")
+                    reqLines.add("# Note: Service counts and details will be determined on Friday")
+                    
+                    def filteredContent = reqLines.join('\n') + '\n'
+
+                    writeFile file: env.REQFILE, text: filteredContent
+                    echo ""
+                    echo "Approval request file created:"
+                    echo "----------------------------------------"
+                    echo filteredContent
+                    echo "----------------------------------------"
+                }
+            }
+        }
+
+        stage('Submit Approval Request') {
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "SUBMITTING APPROVAL REQUEST"
+                    echo "=========================================="
+                    
+                    def curlCommand = """
+                    curl -v -k -F "type=${env.type}" -F "jobfile=@${env.REQFILE}" ${env.API_URL}
+                    """
+                    env.response = sh(script: curlCommand, returnStdout: true).trim()
+                    echo "API response:\n${env.response}"
+
+                    if (env.response ==~ /^\s*$/) {
+                        error("API returned blank output. Check server logs and input file formatting.")
+                    }
+                    
+                    echo ""
+                    echo "✓ Approval request submitted successfully"
+                    echo "Approval ID: ${env.response}"
+                }
+            }
+        }
+
+        stage('Send Teams Notification') {
+            when {
+                expression { params.TEAMS_WEBHOOK && params.TEAMS_WEBHOOK != 'YOUR_WEBHOOK_URL' }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "SENDING TEAMS NOTIFICATION"
+                    echo "=========================================="
+                    
+                    try {
+                        sh """
+                        curl -k -s 'https://jenkins.dev.webserver.insulet.com/approval/teams_notify.php?id=${env.response}&approval_url=https://jenkins.dev.webserver.insulet.com/approval&teams_webhook=${params.TEAMS_WEBHOOK}'
+                        """
+                        echo "✓ Teams notification sent"
+                    } catch (Exception e) {
+                        echo "⚠ WARNING: Failed to send Teams notification: ${e.message}"
+                        echo "Approval request is still active, notification just failed"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (env.REQFILE) {
+                    sh "rm -f ${env.REQFILE}"
+                    echo "Temp file ${env.REQFILE} removed."
+                }
+            }
+        }
+        
+        success {
+            script {
+                echo ""
+                echo "=========================================="
+                echo "APPROVAL REQUEST SUBMITTED SUCCESSFULLY"
+                echo "=========================================="
+                echo "📋 What happens next:"
+                echo ""
+                echo "1. Team reviews the approval request"
+                echo "2. Team can APPROVE or REJECT the shutdown"
+                echo "3. Approval deadline: Friday 4:00 PM"
+                echo ""
+                echo "If APPROVED:"
+                echo "  → Friday 6 PM: Shutdown runs automatically"
+                echo "  → All services in ${env.CLUSTER_NAME} will be shut down"
+                if (env.MONGO_CLUSTER_NAME && env.MONGO_CLUSTER_NAME != '') {
+                    echo "  → MongoDB cluster will be paused"
+                }
+                echo "  → Service details will be captured before shutdown"
+                echo "  → Sunday 6 AM: Everything restored automatically"
+                echo ""
+                echo "If REJECTED or NO RESPONSE:"
+                echo "  → Friday evening: Shutdown will NOT run"
+                echo "  → Services continue running normally"
+                echo "  → No changes made to environment"
+                echo ""
+                echo "Approval Job ID: ${env.response}"
+                echo "Approval URL: https://jenkins.dev.webserver.insulet.com/approval"
+                echo ""
+                echo "Parameters stored:"
+                echo "  Environment: ${env.ENVIRONMENT}"
+                echo "  Cluster: ${env.CLUSTER_NAME}"
+                echo "  Stack: ${env.STACK_NAME ?: 'N/A'}"
+                echo "  MongoDB: ${env.MONGO_CLUSTER_NAME ?: 'Not configured'}"
+                echo "  Requested by: ${BUILD_USER}"
+                echo "=========================================="
+            }
+        }
+        
+        failure {
+            echo ""
+            echo "=========================================="
+            echo "APPROVAL REQUEST FAILED"
+            echo "=========================================="
+            echo "✗ Failed to submit approval request"
+            echo "Check the logs above for details"
+            echo ""
+            echo "Possible issues:"
+            echo "  • Invalid parameters provided"
+            echo "  • Unable to reach approval API"
+            echo "  • Network connectivity issue"
+            echo ""
+            echo "⚠ Weekend shutdown will NOT run unless approved"
+            echo "=========================================="
+        }
+    }
+}

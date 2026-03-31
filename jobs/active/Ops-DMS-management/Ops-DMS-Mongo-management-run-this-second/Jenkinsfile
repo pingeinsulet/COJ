@@ -1,0 +1,131 @@
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+
+    parameters {
+        choice(
+            name: 'PAUSED',
+            choices: ['true', 'false'],
+            description: 'Select true to PAUSE the cluster, false to UNPAUSE the cluster'
+        )
+    }
+    
+    // Note: To use Active Choices Plugin (shows PAUSE/UNPAUSE but stores true/false):
+    // 1. Install "Active Choices Plugin" in Jenkins
+    // 2. Replace above with Active Choice Parameter in Jenkins UI:
+    //    - Name: PAUSED
+    //    - Script: return ['true:selected', 'false']
+    //    - Choice Type: Single Select
+    //    - Description: PAUSE (true) or UNPAUSE (false) the MongoDB cluster
+
+    stages {
+        stage('Pause/Unpause MongoDB Cluster') {
+            steps {
+                withCredentials([string(credentialsId: 'client-auth-mongo-token', variable: 'M_CLIENT_AUTH')]) {
+                    script {
+                        // Split the environment variable into an array
+                        def MongoClusterVar = env.MONGO_CLUSTER_NAME.split(',')
+                        // Assign the first element
+                        def MongoCluster = MongoClusterVar[0]
+                        // Assign the second element
+                        def ProjectID = MongoClusterVar[1]
+                        // Get the pause state directly from parameter (already a boolean string)
+                        def pauseState = params.PAUSED
+                        
+                        // Print values to verify
+                        echo "MongoCluster: ${MongoCluster}"
+                        echo "ProjectID: ${ProjectID}"
+                        echo "Action: ${pauseState == 'true' ? 'PAUSE' : 'UNPAUSE'} (paused = ${pauseState})"
+                        
+                        // Get OAuth token using secure shell variable expansion
+                        def apiResponse = sh(
+                            script: '''
+                                curl --request POST \
+                                --url https://cloud.mongodb.com/api/oauth/token \
+                                --header 'accept: application/json' \
+                                --header 'cache-control: no-cache' \
+                                --header "authorization: Basic $M_CLIENT_AUTH" \
+                                --header 'content-type: application/x-www-form-urlencoded' \
+                                --data 'grant_type=client_credentials'
+                            ''',
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Extract the actual token
+                        def token = apiResponse.replaceFirst(/.*"access_token":"([^"]+)".*/, '$1')
+                        echo "Token obtained successfully"
+                        
+                        // Write token to a temporary file for secure passing
+                        def tokenFile = sh(script: 'mktemp', returnStdout: true).trim()
+                        writeFile file: tokenFile, text: token
+                        
+                        try {
+                            // Use token from file to avoid interpolation
+                            def apiPauseCluster = sh(
+                                script: '''
+                                    TOKEN=$(cat ''' + tokenFile + ''')
+                                    curl --include \
+                                    --header "Authorization: Bearer $TOKEN" \
+                                    --header "Accept: application/vnd.atlas.2025-03-12+json" \
+                                    --header "Content-Type: application/json" \
+                                    -X PATCH "https://cloud.mongodb.com/api/atlas/v2/groups/''' + ProjectID + '''/clusters/''' + MongoCluster + '''" \
+                                    -d '{ "paused" : ''' + pauseState + ''' }'
+                                ''',
+                                returnStdout: true
+                            ).trim()
+
+                            echo "Cluster state change response: ${apiPauseCluster}"
+                            
+                            // Check cluster status after the change
+                            echo ""
+                            echo "Verifying cluster status..."
+                            sleep time: 10, unit: 'SECONDS'
+                            
+                            def statusResponse = sh(
+                                script: '''
+                                    TOKEN=$(cat ''' + tokenFile + ''')
+                                    curl --request GET \
+                                    --header "Authorization: Bearer $TOKEN" \
+                                    --header "Accept: application/vnd.atlas.2025-03-12+json" \
+                                    "https://cloud.mongodb.com/api/atlas/v2/groups/''' + ProjectID + '''/clusters/''' + MongoCluster + '''"
+                                ''',
+                                returnStdout: true
+                            ).trim()
+                            
+                            echo ""
+                            echo "=========================================="
+                            echo "Current Cluster Status:"
+                            echo "=========================================="
+                            echo statusResponse
+                            echo ""
+                            
+                            // Parse and verify the paused state
+                            def statusMatch = statusResponse =~ /"paused"\s*:\s*(true|false)/
+                            if (statusMatch) {
+                                def actualState = statusMatch[0][1]
+                                def expectedAction = pauseState == 'true' ? 'PAUSE' : 'UNPAUSE'
+                                
+                                if (actualState == pauseState) {
+                                    echo "✓ SUCCESS: Cluster is now in the expected state (paused = ${actualState})"
+                                } else {
+                                    echo "⚠ WARNING: Cluster state may still be transitioning"
+                                    echo "  Expected: paused = ${pauseState}"
+                                    echo "  Actual:   paused = ${actualState}"
+                                }
+                            } else {
+                                echo "⚠ Could not parse paused state from status response"
+                            }
+                            
+                        } finally {
+                            // Clean up token file
+                            sh "rm -f '${tokenFile}'"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

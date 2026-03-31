@@ -1,0 +1,92 @@
+import groovy.json.JsonSlurper
+pipeline {
+         agent {
+              ecs {
+                    inheritFrom "jenkins-agent"
+                  }
+                }
+    environment {
+        PHOME = '/home/jenkins/workspace/Cloud_Ops/Omnipod-Operations-TemporaryLogLevelChange'
+        STACK_NAME = "${env.STACK_NAME}"
+        PARMFILE = "${PHOME}/parm.json"
+        REVERTFILE = "${PHOME}/revert.json"
+        SERVICE_PREFIX = "${STACK_NAME}".replaceAll(/^(qa|test)-/, '')
+    }
+
+    stages {
+        stage('Get Existing Parameters') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("http://10.200.2.219/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data)
+                    awsRegion = retList[0] 
+                    sh """
+                        aws cloudformation describe-stacks --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --query 'Stacks[0].Parameters' > ${REVERTFILE}
+                    """
+                }
+            }
+        }
+
+                stage('Create Parameter File') {
+            steps {
+                script {
+                    def logLevel = params.LogLevel ?: error("LogLevel parameter is not defined")
+
+                    def revertJson = readFile("${REVERTFILE}")
+                    def parameters = new groovy.json.JsonSlurperClassic().parseText(revertJson)
+
+                    echo "Retrieved Parameters."
+
+                    parameters.each { param ->
+                        if (param.ParameterKey == 'LogLevel') {
+                            echo "Found LogLevel parameter before modification: ${param.ParameterValue}"
+                            param.ParameterValue = logLevel
+                            echo "Modified LogLevel to: ${param.ParameterValue}"
+                        }
+                    }
+
+                    def updatedJson = new groovy.json.JsonBuilder(parameters).toPrettyString()
+
+                    writeFile file: "${PHOME}/parm.json", text: updatedJson
+                    //. sh "cat ${PHOME}/parm.json"  used for troubleshooting
+                }
+            }
+        }
+
+
+        stage('Update Stack with Parameter File') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("http://10.200.2.219/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data)
+                    awsRegion = retList[0] 
+                    sh """
+                        aws cloudformation update-stack --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --use-previous-template --capabilities CAPABILITY_NAMED_IAM --parameters file://"${PHOME}/parm.json"
+                    """
+
+                    sh "aws cloudformation wait stack-update-complete --profile ${awsProfile} --region ${awsRegion} --stack-name ${STACK_NAME}"
+                }
+            }
+        }
+
+        stage('Wait for Specified Minutes') {
+            steps {
+                sleep time: "${env.DURATION}", unit: 'MINUTES'
+            }
+        }
+
+        stage('Revert Logging Level') {
+            steps {
+                script {
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("http://10.200.2.219/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data)
+                    awsRegion = retList[0]           
+                    sh "aws cloudformation update-stack --region ${awsRegion} --profile ${awsProfile} --stack-name '${STACK_NAME}' --use-previous-template --capabilities CAPABILITY_NAMED_IAM --parameters file://${REVERTFILE}"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,558 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+
+/**
+ * ECS Cluster Direct Shutdown - No Approval Gate
+ *
+ * Performs shutdown with provided parameters. No approval workflow.
+ * - Captures ECS service parameters
+ * - Shuts down ECS services (desired count = 0)
+ * - Scales down ASG (min/max = 0)
+ * - Pauses MongoDB cluster (if configured)
+ */
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['CloudOps_Sandbox-QA', 'RDHorizonDevCloud10x-PERF', 'RDHorizonQACloud-PERF', 'EU_RDHorizonPerfCloud-PERF'], description: 'Select AWS Environment')
+        choice(name: 'CLUSTER_NAME', choices: ['HRZ-QA', 'HRZ-PERF', 'HRZ-PERF10X'], description: 'Select ECS Cluster')
+        string(name: 'STACK_NAME', defaultValue: '', description: 'Stack Name (optional)')
+        choice(name: 'MONGO_CLUSTER_NAME', choices: ['NOT_CONFIGURED', 'CloudOps-Sandbox,6126ae1e9908f639bd5188e0', 'RDHorizonQACloud-Perf,60396d9729673d40a91a3d4b', 'EU-RDHorizonPerfCloud-Perf,6792ba60e497333232c94814', 'RDHorizonDevCloud10x-Perf,64c775396697052b250b7d31'], description: 'MongoDB Cluster Name,Project ID (or NOT_CONFIGURED to skip)')
+        booleanParam(name: 'DRYRUN', defaultValue: false, description: 'If checked, will not make changes but will print commands that would be executed.')
+    }
+
+    environment {
+        type = "ECS_SHUTDOWN"
+        API_URL = "http://jenkins.dev.webserver.insulet.com/approval/create_approval_job.php"
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    if (params.DRYRUN) {
+                        echo "\n⚠ ========== DRYRUN MODE ENABLED =========="
+                        echo "⚠ No actual changes will be made"
+                        echo "⚠ ==========================================\n"
+                    }
+
+                    def awsProfile = params.ENVIRONMENT.replaceFirst(/-(QA|DEV|TEST|Test|INT|PERF|DEV2|ATMTEST|)$/, '')
+                    def data = new URL("https://jenkins.nonprod.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + params.ENVIRONMENT).getText()
+                    def awsRegion = new JsonSlurper().parseText(data)[0].toString()
+
+                    env.AWS_PROFILE = awsProfile
+                    env.AWS_REGION = awsRegion
+
+                    echo "=========================================="
+                    echo "DIRECT SHUTDOWN - PARAMETERS"
+                    echo "=========================================="
+                    echo "Environment: ${params.ENVIRONMENT}"
+                    echo "Cluster: ${params.CLUSTER_NAME}"
+                    echo "Stack: ${params.STACK_NAME ?: 'N/A'}"
+                    echo "MongoDB: ${params.MONGO_CLUSTER_NAME}"
+                    echo "AWS Profile: ${awsProfile}"
+                    echo "AWS Region: ${awsRegion}"
+                    echo "=========================================="
+                }
+            }
+        }
+
+        stage('Capture ECS Service Parameters') {
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "SHUTDOWN - STEP 1: CAPTURE PARAMETERS"
+                    echo "=========================================="
+
+                    def awsProfile = env.AWS_PROFILE
+                    def awsRegion = env.AWS_REGION
+
+                    def serviceNames = sh(
+                        script: "aws --profile ${awsProfile} --region ${awsRegion} ecs list-services --cluster ${params.CLUSTER_NAME} --output text --query 'serviceArns[*]' | tr '\\t' '\\n' | awk -F'/' '{print \$NF}'",
+                        returnStdout: true
+                    ).trim().split('\n')
+
+                    if (!serviceNames || serviceNames.size() == 0 || serviceNames[0] == '') {
+                        echo "No services found in cluster: ${params.CLUSTER_NAME}"
+                        env.SERVICE_LIST = ''
+                        return
+                    }
+
+                    echo "Found ${serviceNames.size()} service(s) in cluster"
+                    echo ""
+
+                    def servicesConfig = []
+                    def serviceList = []
+
+                    for (def serviceName in serviceNames) {
+                        if (!serviceName || serviceName.trim() == '') continue
+
+                        echo "Capturing: ${serviceName}"
+
+                        def desiredCount = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} ecs describe-services --cluster ${params.CLUSTER_NAME} --services ${serviceName} --query 'services[0].desiredCount' --output text",
+                            returnStdout: true
+                        ).trim()
+
+                        def runningCount = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} ecs describe-services --cluster ${params.CLUSTER_NAME} --services ${serviceName} --query 'services[0].runningCount' --output text",
+                            returnStdout: true
+                        ).trim()
+
+                        def taskDefinition = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} ecs describe-services --cluster ${params.CLUSTER_NAME} --services ${serviceName} --query 'services[0].taskDefinition' --output text",
+                            returnStdout: true
+                        ).trim()
+
+                        def launchType = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} ecs describe-services --cluster ${params.CLUSTER_NAME} --services ${serviceName} --query 'services[0].launchType' --output text 2>/dev/null || echo 'EC2'",
+                            returnStdout: true
+                        ).trim()
+
+                        def scalingInfo = sh(
+                            script: "aws --profile ${awsProfile} --region ${awsRegion} application-autoscaling describe-scalable-targets --service-namespace ecs --resource-id service/${params.CLUSTER_NAME}/${serviceName} --query 'ScalableTargets[0].[MinCapacity,MaxCapacity,RoleARN,ScalableDimension]' --output text 2>/dev/null || echo 'NONE'",
+                            returnStdout: true
+                        ).trim()
+
+                        def minCapacity = 0
+                        def maxCapacity = 0
+                        def roleArn = ''
+                        def scalableDimension = 'ecs:service:DesiredCount'
+                        def hasAutoScaling = false
+
+                        if (scalingInfo != 'NONE' && scalingInfo != '' && scalingInfo != 'None') {
+                            def scalingParts = scalingInfo.split('\t')
+                            if (scalingParts.size() >= 3) {
+                                minCapacity = scalingParts[0].toInteger()
+                                maxCapacity = scalingParts[1].toInteger()
+                                roleArn = scalingParts[2]
+                                if (scalingParts.size() >= 4) scalableDimension = scalingParts[3]
+                                hasAutoScaling = true
+                            }
+                        }
+
+                        def updateServiceCmd = "aws --profile ${awsProfile} --region ${awsRegion} ecs update-service --cluster ${params.CLUSTER_NAME} --service ${serviceName} --desired-count ${desiredCount}"
+                        def registerAutoScalingCmd = hasAutoScaling ? "aws --profile ${awsProfile} --region ${awsRegion} application-autoscaling register-scalable-target --service-namespace ecs --resource-id service/${params.CLUSTER_NAME}/${serviceName} --scalable-dimension ${scalableDimension} --min-capacity ${minCapacity} --max-capacity ${maxCapacity} --role-arn ${roleArn}" : ""
+
+                        serviceList.add(serviceName)
+                        env."${serviceName}_DESIRED_COUNT" = desiredCount
+                        env."${serviceName}_AUTOSCALING_ENABLED" = hasAutoScaling.toString()
+                        env."${serviceName}_AUTOSCALING_MIN" = minCapacity.toString()
+                        env."${serviceName}_AUTOSCALING_MAX" = maxCapacity.toString()
+                        env."${serviceName}_AUTOSCALING_ROLE" = roleArn
+                        env."${serviceName}_AUTOSCALING_SCALABLE_DIMENSION" = scalableDimension
+
+                        def serviceEntry = [
+                            serviceName: serviceName,
+                            desiredCount: desiredCount.toInteger(),
+                            runningCount: runningCount.toInteger(),
+                            taskDefinition: taskDefinition,
+                            launchType: launchType,
+                            autoScaling: [
+                                enabled: hasAutoScaling,
+                                minCapacity: minCapacity,
+                                maxCapacity: maxCapacity,
+                                roleArn: roleArn
+                            ],
+                            awsCommands: [
+                                updateService: updateServiceCmd,
+                                registerAutoScaling: registerAutoScalingCmd
+                            ]
+                        ]
+                        servicesConfig.add(serviceEntry)
+                        echo "  desired=${desiredCount}, running=${runningCount}, autoScaling=${hasAutoScaling}"
+                    }
+
+                    env.SERVICE_LIST = serviceList.join(',')
+                    env.TOTAL_SERVICES = servicesConfig.size().toString()
+
+                    def configJson = [
+                        metadata: [
+                            environment: params.ENVIRONMENT,
+                            cluster: params.CLUSTER_NAME,
+                            awsProfile: awsProfile,
+                            awsRegion: awsRegion,
+                            captureTimestamp: new Date().toString(),
+                            capturedBy: "${BUILD_USER}"
+                        ],
+                        services: servicesConfig
+                    ]
+                    def jsonFileName = "ecs_shutdown_config_${params.CLUSTER_NAME.replaceAll('[^a-zA-Z0-9]', '_')}_${env.BUILD_NUMBER}.json"
+                    writeFile file: jsonFileName, text: JsonOutput.prettyPrint(JsonOutput.toJson(configJson))
+                    env.CONFIG_FILE = jsonFileName
+                    archiveArtifacts artifacts: jsonFileName, fingerprint: true
+
+                    echo ""
+                    echo "✓ Parameter capture complete"
+                    echo "=========================================="
+                }
+            }
+        }
+
+        stage('Scale Down ASG') {
+            when {
+                expression { env.SERVICE_LIST && env.SERVICE_LIST != '' }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "SHUTDOWN - STEP 2: SCALE DOWN ASG"
+                    echo "=========================================="
+
+                    def services = env.SERVICE_LIST.split(',')
+                    def successCount = 0
+                    def skipCount = 0
+                    def errorCount = 0
+
+                    for (def serviceName in services) {
+                        if (!serviceName || serviceName.trim() == '') continue
+
+                        def asgEnabled = env."${serviceName}_AUTOSCALING_ENABLED"
+                        if (asgEnabled != 'true') {
+                            skipCount++
+                            continue
+                        }
+
+                        def roleArn = env."${serviceName}_AUTOSCALING_ROLE"
+                        def dimension = env."${serviceName}_AUTOSCALING_SCALABLE_DIMENSION" ?: 'ecs:service:DesiredCount'
+
+                        echo "Scaling down ASG for: ${serviceName}"
+
+                        try {
+                            def asgCommand = """aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} application-autoscaling register-scalable-target --service-namespace ecs --resource-id service/${params.CLUSTER_NAME}/${serviceName} --scalable-dimension ${dimension} --min-capacity 0 --max-capacity 0 --role-arn ${roleArn}"""
+                            if (params.DRYRUN) {
+                                echo "[DRYRUN] Would execute: ${asgCommand}"
+                            } else {
+                                sh(script: asgCommand, returnStdout: true)
+                            }
+                            successCount++
+                        } catch (Exception e) {
+                            echo "  ✗ Error: ${e.message}"
+                            errorCount++
+                        }
+                    }
+
+                    echo "ASG scale-down: ✓ ${successCount} ⊘ ${skipCount} ✗ ${errorCount}"
+                    echo "=========================================="
+                }
+            }
+        }
+
+        stage('Shutdown ECS Services') {
+            when {
+                expression { env.SERVICE_LIST && env.SERVICE_LIST != '' }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "SHUTDOWN - STEP 3: SHUTDOWN ECS SERVICES"
+                    echo "=========================================="
+
+                    def services = env.SERVICE_LIST.split(',')
+                    def successCount = 0
+                    def errorCount = 0
+
+                    for (def serviceName in services) {
+                        if (!serviceName || serviceName.trim() == '') continue
+
+                        echo "Shutting down: ${serviceName}"
+
+                        try {
+                            def updateCommand = """aws --profile ${env.AWS_PROFILE} --region ${env.AWS_REGION} ecs update-service --cluster ${params.CLUSTER_NAME} --service ${serviceName} --desired-count 0"""
+                            if (params.DRYRUN) {
+                                echo "[DRYRUN] Would execute: ${updateCommand}"
+                            } else {
+                                sh(script: updateCommand, returnStdout: true)
+                            }
+                            successCount++
+                        } catch (Exception e) {
+                            echo "  ✗ Error: ${e.message}"
+                            errorCount++
+                        }
+                    }
+
+                    echo ""
+                    echo "ECS shutdown: ✓ ${successCount} ✗ ${errorCount}"
+                    echo "=========================================="
+                }
+            }
+        }
+
+        stage('Pause MongoDB Cluster') {
+            when {
+                expression {
+                    params.MONGO_CLUSTER_NAME &&
+                    params.MONGO_CLUSTER_NAME != '' &&
+                    params.MONGO_CLUSTER_NAME != 'NOT_CONFIGURED'
+                }
+            }
+            steps {
+                withCredentials([string(credentialsId: 'client-auth-mongo-token', variable: 'M_CLIENT_AUTH')]) {
+                    script {
+                        echo ""
+                        echo "=========================================="
+                        echo "SHUTDOWN - STEP 4: PAUSE MONGODB"
+                        echo "=========================================="
+
+                        def MongoClusterVar = params.MONGO_CLUSTER_NAME.split(',')
+                        def MongoCluster = MongoClusterVar[0]
+                        def ProjectID = MongoClusterVar[1]
+                        def pauseState = 'true'
+
+                        echo "MongoCluster: ${MongoCluster}"
+                        echo "ProjectID: ${ProjectID}"
+                        echo "Action: PAUSE (paused = ${pauseState})"
+
+                        if (params.DRYRUN) {
+                            echo "[DRYRUN] Would pause MongoDB cluster ${MongoCluster}"
+                            return
+                        }
+
+                        def apiResponse = sh(
+                            script: """
+                                curl --request POST \
+                                --url https://cloud.mongodb.com/api/oauth/token \
+                                --header 'accept: application/json' \
+                                --header 'cache-control: no-cache' \
+                                --header "authorization: Basic \${M_CLIENT_AUTH}" \
+                                --header 'content-type: application/x-www-form-urlencoded' \
+                                --data 'grant_type=client_credentials'
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (apiResponse.contains('"error"')) {
+                            error("Failed to obtain MongoDB OAuth token: ${apiResponse}")
+                        }
+
+                        def token = apiResponse.replaceFirst(/.*"access_token":"([^"]+)".*/, '$1')
+                        def tokenFile = sh(script: 'mktemp', returnStdout: true).trim()
+                        writeFile file: tokenFile, text: token
+
+                        try {
+                            sh(
+                                script: """
+                                    TOKEN=\$(cat ${tokenFile})
+                                    curl --include \
+                                    --header "Authorization: Bearer \$TOKEN" \
+                                    --header "Accept: application/vnd.atlas.2025-03-12+json" \
+                                    --header "Content-Type: application/json" \
+                                    -X PATCH "https://cloud.mongodb.com/api/atlas/v2/groups/${ProjectID}/clusters/${MongoCluster}" \
+                                    -d '{ "paused" : true }'
+                                """,
+                                returnStdout: true
+                            )
+                            echo "✓ MongoDB cluster pause requested"
+                            sleep time: 10, unit: 'SECONDS'
+                        } finally {
+                            sh "rm -f '${tokenFile}'"
+                        }
+
+                        echo "=========================================="
+                    }
+                }
+            }
+        }
+
+        stage('Prepare Request File') {
+            when {
+                expression { env.SERVICE_LIST && env.SERVICE_LIST != '' && !params.DRYRUN }
+            }
+            steps {
+                script {
+                    env.REQFILE = sh(script: "mktemp /tmp/agreq.XXXXXX.txt", returnStdout: true).trim()
+                    def fullName = "${BUILD_USER}"
+                    def timestamp = sh(script: "date '+%Y-%m-%d %H:%M:%S %Z'", returnStdout: true).trim()
+
+                    def reqLines = []
+                    reqLines.add("# === Job Parameters Below ===")
+                    reqLines.add("AGuserid=\"${fullName}\"")
+                    reqLines.add("ENVIRONMENT=${params.ENVIRONMENT}")
+                    reqLines.add("STACK_NAME=${params.STACK_NAME ?: ''}")
+                    reqLines.add("CLUSTER_NAME=${params.CLUSTER_NAME}")
+                    reqLines.add("CONFIG_FILE=${env.CONFIG_FILE}")
+                    reqLines.add("TOTAL_SERVICES=${env.TOTAL_SERVICES}")
+                    reqLines.add("CAPTURE_TIMESTAMP=${timestamp}")
+                    reqLines.add("AWS_PROFILE=${env.AWS_PROFILE}")
+                    reqLines.add("AWS_REGION=${env.AWS_REGION}")
+                    reqLines.add("MONGO_CLUSTER_NAME=${params.MONGO_CLUSTER_NAME ?: 'NOT_CONFIGURED'}")
+                    reqLines.add("")
+                    reqLines.add("# === Service Parameters Below ===")
+
+                    def serviceNamesList = sh(
+                        script: "cat ${env.CONFIG_FILE} | grep '\"serviceName\"' | cut -d'\"' -f4",
+                        returnStdout: true
+                    ).trim().split('\n')
+
+                    for (def svcName in serviceNamesList) {
+                        if (!svcName || svcName.trim() == '') continue
+                        reqLines.add("")
+                        reqLines.add("# SERVICE: ${svcName}")
+
+                        def desiredCount = sh(script: "cat ${env.CONFIG_FILE} | grep -A 50 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"desiredCount\"' | head -1 | grep -o '[0-9]*'", returnStdout: true).trim()
+                        def runningCount = sh(script: "cat ${env.CONFIG_FILE} | grep -A 50 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"runningCount\"' | head -1 | grep -o '[0-9]*'", returnStdout: true).trim()
+                        def taskDef = sh(script: "cat ${env.CONFIG_FILE} | grep -A 50 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"taskDefinition\"' | head -1 | cut -d'\"' -f4", returnStdout: true).trim()
+                        def launchType = sh(script: "cat ${env.CONFIG_FILE} | grep -A 50 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"launchType\"' | head -1 | cut -d'\"' -f4", returnStdout: true).trim()
+                        def updateCmd = sh(script: "cat ${env.CONFIG_FILE} | grep -A 100 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"updateService\"' | head -1 | sed 's/.*\"updateService\"[[:space:]]*:[[:space:]]*\"//' | sed 's/\".*//'", returnStdout: true).trim()
+
+                        reqLines.add("${svcName}_DESIRED_COUNT=${desiredCount}")
+                        reqLines.add("${svcName}_RUNNING_COUNT=${runningCount}")
+                        reqLines.add("${svcName}_TASK_DEFINITION=${taskDef}")
+                        reqLines.add("${svcName}_LAUNCH_TYPE=${launchType}")
+                        reqLines.add("${svcName}_UPDATE_CMD=${updateCmd}")
+
+                        def hasAutoScaling = sh(script: "cat ${env.CONFIG_FILE} | grep -A 50 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"enabled\"[[:space:]]*:[[:space:]]*true' | wc -l", returnStdout: true).trim()
+                        if (hasAutoScaling != "0") {
+                            def minCap = sh(script: "cat ${env.CONFIG_FILE} | grep -A 60 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"minCapacity\"' | head -1 | grep -o '[0-9]*'", returnStdout: true).trim()
+                            def maxCap = sh(script: "cat ${env.CONFIG_FILE} | grep -A 60 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"maxCapacity\"' | head -1 | grep -o '[0-9]*'", returnStdout: true).trim()
+                            def roleArn = sh(script: "cat ${env.CONFIG_FILE} | grep -A 60 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"roleArn\"' | head -1 | cut -d'\"' -f4", returnStdout: true).trim()
+                            def asCmd = sh(script: "cat ${env.CONFIG_FILE} | grep -A 100 '\"serviceName\"[[:space:]]*:[[:space:]]*\"${svcName}\"' | grep '\"registerAutoScaling\"' | head -1 | sed 's/.*\"registerAutoScaling\"[[:space:]]*:[[:space:]]*\"//' | sed 's/\".*//'", returnStdout: true).trim()
+                            reqLines.add("${svcName}_AUTOSCALING_ENABLED=true")
+                            reqLines.add("${svcName}_AUTOSCALING_MIN=${minCap}")
+                            reqLines.add("${svcName}_AUTOSCALING_MAX=${maxCap}")
+                            reqLines.add("${svcName}_AUTOSCALING_ROLE=${roleArn}")
+                            reqLines.add("${svcName}_AUTOSCALING_SCALABLE_DIMENSION=ecs:service:DesiredCount")
+                            if (asCmd && asCmd != "") reqLines.add("${svcName}_AUTOSCALING_CMD=${asCmd}")
+                        } else {
+                            reqLines.add("${svcName}_AUTOSCALING_ENABLED=false")
+                        }
+                    }
+
+                    writeFile file: env.REQFILE, text: reqLines.join('\n') + '\n'
+                    echo "Request file prepared: ${env.REQFILE}"
+                }
+            }
+        }
+
+        stage('Upload to Approval API') {
+            when {
+                expression { env.SERVICE_LIST && env.SERVICE_LIST != '' && !params.DRYRUN }
+            }
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "SHUTDOWN - STEP 5: UPLOAD TO APPROVAL API"
+                    echo "=========================================="
+
+                    def curlCommand = """
+                    curl -v -k -F "type=${env.type}" -F "jobfile=@${env.REQFILE}" -F "configfile=@${env.CONFIG_FILE}" ${env.API_URL}
+                    """
+                    def response = sh(script: curlCommand, returnStdout: true).trim()
+                    echo "API response (Job ID): ${response}"
+
+                    env.APPROVAL_JOB_ID = response.trim()
+                    echo "✓ Configuration uploaded. Job ID: ${env.APPROVAL_JOB_ID}"
+                    echo "=========================================="
+                }
+            }
+        }
+
+        stage('Send Email Notification') {
+            when {
+                expression { env.APPROVAL_JOB_ID && env.APPROVAL_JOB_ID != '' && !params.DRYRUN }
+            }
+            steps {
+                script {
+                    def userEmail = env.BUILD_USER_EMAIL ?: "${env.BUILD_USER}@insulet.com"
+
+                    sh """
+                        rm -rf deploymenttemplatelibrary clouddeployment
+
+                        git clone https://bitbucket.insulet.com/scm/cldops/clouddeployment.git
+                        git clone https://bitbucket.insulet.com/scm/cldops/deploymenttemplatelibrary.git
+
+                        cd deploymenttemplatelibrary
+                        git checkout develop
+
+                        cd ../clouddeployment/deploy-cloud
+                        git checkout develop
+
+                        mv templates templates-org
+                        ln -s ../../deploymenttemplatelibrary/templates .
+
+                        export RELEASE_TEMPLATES=../../deploymenttemplatelibrary
+                        export AWS_PROFILE=WAADS3ACCESS
+
+                        echo " <br><br> ECS services have been shut down successfully. <br>" > ../../mailfile.txt
+                        echo " <br> Environment: ${params.ENVIRONMENT} <br>" >> ../../mailfile.txt
+                        echo " <br> Cluster: ${params.CLUSTER_NAME} <br>" >> ../../mailfile.txt
+                        echo " <br> Stack: ${params.STACK_NAME ?: 'N/A'} <br>" >> ../../mailfile.txt
+                        echo " <br> Total Services: ${env.TOTAL_SERVICES} <br>" >> ../../mailfile.txt
+                        echo " <br><br> To start the services back up, use the following Job ID in the startup pipeline: <br>" >> ../../mailfile.txt
+                        echo " <br> <b>Job ID: ${env.APPROVAL_JOB_ID}</b> <br>" >> ../../mailfile.txt
+                        echo " <br><br> You can run the startup pipeline with the Job ID parameter set to: ${env.APPROVAL_JOB_ID} <br>" >> ../../mailfile.txt
+                        echo " <br><br> This is an automated message from Jenkins. <br>" >> ../../mailfile.txt
+                        echo " <br> Build: ${env.JOB_NAME} #${env.BUILD_NUMBER} <br>" >> ../../mailfile.txt
+
+                        cat ../../mailfile.txt
+
+                        echo "#!/bin/bash" > ../../email.sh
+                        echo "source lib/emaillib.sh" >> ../../email.sh
+                        echo "send_html_email \"EmailSender-NoReply@omnipodapps.com\" \"${userEmail}\" \"ECS Shutdown Complete - ${params.ENVIRONMENT}\" ../../mailfile.txt" >> ../../email.sh
+
+                        chmod +x ../../email.sh
+                        ../../email.sh
+                    """
+
+                    echo "✓ Email notification sent to ${userEmail}"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (env.REQFILE) {
+                    sh "rm -f ${env.REQFILE}"
+                }
+            }
+        }
+        success {
+            script {
+                def dryrunPrefix = params.DRYRUN ? "[DRYRUN] " : ""
+                echo ""
+                echo "=========================================="
+                echo "DIRECT SHUTDOWN COMPLETED SUCCESSFULLY"
+                echo "=========================================="
+                echo "${dryrunPrefix}✓ ECS services shut down"
+                if (params.MONGO_CLUSTER_NAME && params.MONGO_CLUSTER_NAME != 'NOT_CONFIGURED') {
+                    echo "${dryrunPrefix}✓ MongoDB cluster paused"
+                }
+                if (env.APPROVAL_JOB_ID) {
+                    echo "${dryrunPrefix}✓ Configuration uploaded to approval API"
+                    echo ""
+                    echo "  Job ID: ${env.APPROVAL_JOB_ID}"
+                }
+                echo ""
+                echo "Environment: ${params.ENVIRONMENT}"
+                echo "Cluster: ${params.CLUSTER_NAME}"
+                echo "=========================================="
+            }
+        }
+
+        failure {
+            echo ""
+            echo "=========================================="
+            echo "DIRECT SHUTDOWN FAILED"
+            echo "=========================================="
+            echo "✗ Check the logs above for details"
+            echo "=========================================="
+        }
+
+        aborted {
+            echo ""
+            echo "=========================================="
+            echo "DIRECT SHUTDOWN ABORTED"
+            echo "=========================================="
+        }
+    }
+}

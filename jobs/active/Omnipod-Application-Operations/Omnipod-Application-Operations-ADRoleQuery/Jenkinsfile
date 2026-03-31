@@ -1,0 +1,102 @@
+/**
+ * Jenkins Pipeline: pass a role name (string parameter), returns the list of AD role members.
+ *
+ * Prerequisites:
+ * - Jenkins credentials: azure-ad-tenant-id, azure-ad-client-id, azure-ad-client-secret
+ * - On agent: curl, jq (all API + JSON done in shell so pipeline state is serializable when agent reconnects)
+ */
+pipeline {
+    agent {
+        ecs {
+            inheritFrom 'jenkins-agent'
+        }
+    }
+
+    parameters {
+        string(
+            name: 'ROLE_NAME',
+            defaultValue: '',
+            description: 'Azure AD group/role display name or group object ID (GUID). Returns the list of members.'
+        )
+    }
+
+    stages {
+        stage('Get AD role members') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'azure-ad-tenant-id', variable: 'AZURE_TENANT_ID'),
+                    string(credentialsId: 'azure-ad-client-id', variable: 'AZURE_CLIENT_ID'),
+                    string(credentialsId: 'azure-ad-client-secret', variable: 'AZURE_CLIENT_SECRET')
+                ]) {
+                    script {
+                        if (!params.ROLE_NAME?.trim()) {
+                            error('ROLE_NAME parameter is required.')
+                        }
+                        // All Graph API + JSON in one sh step so Groovy only holds serializable data (strings).
+                        // Avoids NotSerializableException (LazyMap/JsonSlurper) when agent disconnects and reconnects.
+                        def roleName = params.ROLE_NAME.trim()
+                        def membersOutput
+                        withEnv(["ROLE_NAME=${roleName}"]) {
+                            membersOutput = sh(
+                                script: """
+                                set -e
+                                ROLE=\${ROLE_NAME}
+                                TOKEN=\$(curl -s -X POST "https://login.microsoftonline.com/\$AZURE_TENANT_ID/oauth2/v2.0/token" \\
+                                  --data-urlencode "grant_type=client_credentials" \\
+                                  --data-urlencode "client_id=\$AZURE_CLIENT_ID" \\
+                                  --data-urlencode "client_secret=\$AZURE_CLIENT_SECRET" \\
+                                  --data-urlencode "scope=https://graph.microsoft.com/.default" | jq -r '.access_token')
+                                if [ -z "\$TOKEN" ] || [ "\$TOKEN" = "null" ]; then echo "Failed to get token" >&2; exit 1; fi
+                                if [[ "\$ROLE" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\$ ]]; then
+                                  GROUP_ID="\$ROLE"
+                                else
+                                  SAFE=\$(echo "\$ROLE" | sed "s/'/''/g")
+                                  FILTER="startswith(displayName,'\$SAFE')"
+                                  ENC=\$(echo -n "\$FILTER" | jq -sRr @uri)
+                                  BODY_FILE=\$(mktemp)
+                                  HTTP_CODE=\$(curl -s -o "\$BODY_FILE" -w "%{http_code}" -H "Authorization: Bearer \$TOKEN" "https://graph.microsoft.com/v1.0/groups?\\\$filter=\$ENC&\\\$select=id,displayName")
+                                  GROUP_ID=\$(jq -r '.value[0].id // empty' "\$BODY_FILE")
+                                  if [ -z "\$GROUP_ID" ]; then
+                                    echo "=== AD role query failed: no group found for '\$ROLE' ==="
+                                    echo "HTTP status: \$HTTP_CODE"
+                                    ERR_MSG=\$(jq -r '.error.message // empty' "\$BODY_FILE")
+                                    if [ -n "\$ERR_MSG" ]; then echo "Graph API error: \$ERR_MSG"; fi
+                                    echo "Response body (first 800 chars):"
+                                    head -c 800 "\$BODY_FILE"
+                                    echo ""
+                                    rm -f "\$BODY_FILE"
+                                    exit 1
+                                  fi
+                                  rm -f "\$BODY_FILE"
+                                fi
+                                URL="https://graph.microsoft.com/v1.0/groups/\$GROUP_ID/members"
+                                while [ -n "\$URL" ]; do
+                                  RESP=\$(curl -s -H "Authorization: Bearer \$TOKEN" "\$URL")
+                                  echo "\$RESP" | jq -r '.value[]? | select(.["@odata.type"]=="#microsoft.graph.user") | .userPrincipalName // .mail // .displayName // .id'
+                                  URL=\$(echo "\$RESP" | jq -r '.["@odata.nextLink"] // empty')
+                                done
+                            """,
+                                returnStdout: true
+                            ).trim()
+                        }
+                        def members = membersOutput ? membersOutput.split('\n').collect { it.trim() }.findAll { it } : []
+                        echo "Role: ${params.ROLE_NAME}"
+                        echo "Members (${members.size()}): ${members.join(', ')}"
+                        env.AD_ROLE_MEMBERS = members.join('\n')
+                        env.AD_ROLE_MEMBERS_COUNT = "${members.size()}"
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                if (env.AD_ROLE_MEMBERS?.trim()) {
+                    echo "--- Members list (one per line) ---"
+                    echo env.AD_ROLE_MEMBERS
+                }
+            }
+        }
+    }
+}

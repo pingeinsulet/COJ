@@ -1,0 +1,95 @@
+import groovy.json.JsonSlurper
+
+/**
+ * Azure Web App Stop
+ *
+ * Stops web apps tagged with AutoStopPolicy=test.
+ */
+pipeline {
+    agent { label 'jenkins-agent' }
+
+    environment {
+        PATH = "${env.HOME}/bin:${env.PATH}"
+    }
+
+    parameters {
+        string(name: 'SUBSCRIPTION', defaultValue: 'Insulet US - DMS Dev', description: 'Azure subscription name or ID.')
+        string(name: 'TAG', defaultValue: 'AutoStopPolicy=test', description: 'Tag filter (key=value).')
+        booleanParam(name: 'DRYRUN', defaultValue: false, description: 'List only; no stop.')
+        booleanParam(name: 'SKIP_AZ_LOGIN', defaultValue: false, description: 'Skip login (managed identity).')
+    }
+
+    stages {
+        stage('Azure Login') {
+            when { expression { !params.SKIP_AZ_LOGIN } }
+            steps {
+                withCredentials([
+                    string(credentialsId: 'azure-ad-tenant-id', variable: 'AZURE_TENANT_ID'),
+                    string(credentialsId: 'azure-ad-client-id', variable: 'AZURE_CLIENT_ID'),
+                    string(credentialsId: 'azure-ad-client-secret', variable: 'AZURE_CLIENT_SECRET')
+                ]) {
+                    sh '''
+                        export PATH="$HOME/bin:$PATH"
+                        az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output none
+                    '''
+                    sh "export PATH=\"\$HOME/bin:\$PATH\" && az account set -s \"${params.SUBSCRIPTION}\""
+                    sh 'export PATH="$HOME/bin:$PATH" && az account show -o table'
+                }
+            }
+        }
+
+        stage('Stop Web Apps') {
+            steps {
+                script {
+                    def tagParts = params.TAG.split('=', 2)
+                    def tagKey = tagParts[0]?.trim() ?: 'AutoStopPolicy'
+                    def tagValue = tagParts.size() > 1 ? tagParts[1].trim() : 'test'
+
+                    if (params.DRYRUN) {
+                        echo "DRYRUN: Listing web apps with tag ${tagKey}=${tagValue}"
+                    }
+
+                    def appJson = sh(
+                        script: "export PATH=\"\$HOME/bin:\$PATH\" && az resource list --tag '${tagKey}=${tagValue}' --query \"[?type=='Microsoft.Web/sites'].{name:name, resourceGroup:resourceGroup}\" -o json",
+                        returnStdout: true
+                    ).trim()
+
+                    def apps = []
+                    if (appJson && appJson != '[]') {
+                        def parsed = new JsonSlurper().parseText(appJson)
+                        if (!(parsed instanceof List)) parsed = [parsed]
+                        // Convert LazyMap to HashMap so Jenkins can serialize pipeline state
+                        apps = parsed.collect { a -> [name: a.name.toString(), resourceGroup: a.resourceGroup.toString()] }
+                    }
+
+                    if (!apps || apps.size() == 0) {
+                        echo "No web apps found with tag ${tagKey}=${tagValue}"
+                        echo ""
+                        echo "--- Diagnostic: all web apps with tags ---"
+                        def allJson = sh(script: "export PATH=\"\$HOME/bin:\$PATH\" && az resource list --resource-type Microsoft.Web/sites --query \"[].{name:name, resourceGroup:resourceGroup, tags:tags}\" -o json", returnStdout: true).trim()
+                        def parsedAll = new JsonSlurper().parseText(allJson)
+                        if (!(parsedAll instanceof List)) parsedAll = [parsedAll]
+                        def all = parsedAll.collect { a ->
+                            def tagStr = a.tags ? a.tags.collect { k, v -> "${k}=${v}" }.join(', ') : '(none)'
+                            [name: a.name.toString(), resourceGroup: a.resourceGroup.toString(), tagsStr: tagStr]
+                        }
+                        all.each { a ->
+                            echo "  ${a.name} | ${a.resourceGroup} | ${a.tagsStr}"
+                        }
+                        return
+                    }
+
+                    echo "Found ${apps.size()} web app(s)"
+                    apps.each { echo "  ${it.name} (${it.resourceGroup})" }
+
+                    if (!params.DRYRUN) {
+                        apps.each { app ->
+                            sh "export PATH=\"\$HOME/bin:\$PATH\" && az webapp stop --resource-group '${app.resourceGroup}' --name '${app.name}'"
+                            echo "  ✓ Stopped ${app.name}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

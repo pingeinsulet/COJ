@@ -1,0 +1,35 @@
+import groovy.json.JsonSlurper
+pipeline {
+    
+    agent {
+          ecs {
+                inheritFrom "jenkins-agent"
+                 }
+            } 
+    environment {
+        AWS_DEFAULT_REGION = "${env.AWS_DEFAULT_REGION}"
+        AWS_PROFILE = "${env.AWS_PROFILE}"
+        SERVICE_PREFIX = "${STACK_NAME}".replaceAll(/^(qa|test)-/, '')
+        CLUSTER_NAME = "${env.CLUSTER_NAME}".replaceAll(",", "")
+    }
+
+    stages {
+       
+        stage('Revert Parameter Name') {
+            steps {
+                script {
+                    def serviceName = env.SERVICE_PREFIX.replaceFirst(/-(qa|test|int|perf)$/, '')
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def data = new URL("http://10.200.2.219/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+                    awsRegion = retList[0] 
+                    sh """
+                    echo "Restarting ECS service..."    
+                          aws ecs update-service --profile ${awsProfile} --region ${awsRegion} --cluster ${CLUSTER_NAME} --service ${serviceName} --force-new-deployment
+                    echo "ECS service has been restarted."                    
+                    """
+                }
+            }
+        }
+    }
+}

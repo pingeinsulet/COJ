@@ -1,0 +1,74 @@
+// Build the remote configuration using the UI-supplied parameters
+def remote = [:]
+remote.name = "ec2-instance"
+// Optionally, you can adjust the host using parameters or additional logic if needed
+remote.host = "10.246.213.155"  // Replace with your EC2 instance's IP address or DNS
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom "jenkins-agent"
+        }
+    }
+    stages {
+        stage('Prepare SSH Connection') {
+            steps {
+                script {
+                    try {
+                        echo "Starting SSH connection preparation..."
+                        remote.allowAnyHosts = true
+                        remote.user = params.EC2_USER
+                        remote.identityFile = "/var/jenkins_home/${params.EC2_USER}"
+                        
+                        echo "Remote configuration:"
+                        echo "  User: ${remote.user}"
+                        echo "  Host: ${remote.host}"
+                        echo "  IdentityFile: ${remote.identityFile}"
+                        
+                        // Test the SSH connection using runscript
+                        def testOutput = sshCommand remote: remote, command: 'echo "Connected successfully to user: $(whoami)"'
+                        echo "SSH test output: ${testOutput}"
+                        
+                    } catch (Exception e) {
+                        echo "Error during SSH connection preparation: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error "Aborting pipeline due to SSH connection preparation error."
+                    }
+                }
+            }
+        }
+        stage('Run delete command') {
+            steps {
+                script {
+                    try {
+                        // Build the directory name using the ENVIRONAMENT parameter (e.g. "EU_RDHorizonQACloud-QA")
+                        def EnvDir = "/home/${remote.user}/deploy/${params.ENVIRONMENT}"
+                        
+                        
+                        def command = "rm -rf ${EnvDir}/"
+                        echo "Executing command: ${command}"
+                            
+                        // Execute the command on the remote EC2 instance via SSH
+                        def DeleteOutput = sshCommand remote: remote, command: command
+                        echo "Command outpput: ${DeleteOutput}"
+                    } catch (Exception e) {
+                        echo "Error during command execution: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error "Aborting pipeline due to Command execution error."
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo "Pipeline completed."
+        }
+        success {
+            echo "Pipeline succeeded."
+        }
+        failure {
+            echo "Pipeline failed. Please review the logs for details."
+        }
+    }
+}

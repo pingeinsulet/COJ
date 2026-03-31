@@ -1,0 +1,91 @@
+import groovy.json.JsonSlurper
+pipeline {
+    
+    agent {
+          ecs {
+                inheritFrom "jenkins-agent"
+                 }
+            } 
+    environment {
+        SERVICE_PREFIX = "${STACK_NAME}".replaceAll(/^(qa|test)-/, '')
+
+    }
+
+    stages {
+                stage('Check Approval Status') {
+            steps {
+                script {
+                    def jobType = "OORM0001"
+                    def apiUrl = "https://jenkins.dev.webserver.insulet.com/approval/get_next_job.php?type=${jobType}"
+                    def jobNumberRaw = sh(
+                        script: "curl -s -k '${apiUrl}' | sed '/^\\s*\$/d'",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "API response (filtered): '${jobNumberRaw}'"
+
+                    if (!jobNumberRaw) {
+                        error "No job available for type ${jobType}. Skipping execution."
+
+                    }
+
+                    def jobNumber = jobNumberRaw.toInteger()
+                    echo " Valid job number received: ${jobNumber}"
+
+                    env.JOB_ID = jobNumber.toString()
+                }
+            }
+        }
+
+        stage('Fetch Parameters from Job File') {
+            steps {
+                script {
+                    def jobFilePath = sh(script: "mktemp", returnStdout: true).trim()
+                    def fetchUrl = "https://jenkins.dev.webserver.insulet.com/approval/fetch_job_file.php?jobid=${env.JOB_ID}"
+
+                    echo "📄 Fetching jobfile from ${fetchUrl}"
+                    echo "📄 Temp job file path: ${jobFilePath}"
+
+                    sh """
+                        curl -sk '${fetchUrl}' -o '${jobFilePath}'
+                    """
+
+                    def lines = readFile(jobFilePath).readLines()
+                    for (line in lines) {
+                        line = line.trim()
+                        if (line.startsWith("#") || line.isEmpty()) continue
+                        def (key, value) = line.tokenize("=")
+                        key = key?.trim()?.toUpperCase()
+                        value = value?.trim()?.replaceAll(/^"|"$/, '')
+                        if (key && value) {
+                            echo "Setting env: ${key}=${value}"
+                            env."${key}" = value
+                        }
+                    }
+
+                    sh "rm -f '${jobFilePath}'"
+                }
+            }
+        } 
+       
+        stage('restart service') {
+            steps {
+                script {
+                    def serviceName = env.STACK_NAME.replaceAll(/^(qa|test|int|perf)-/, '')
+                    def awsProfile = env.ENVIRONMENT.replaceFirst(/-(QA|TEST|INT|PERF)$/, '')
+                    def clusterName = env.CLUSTER_NAME.replaceAll(/,\s*$/, '')
+                    def data = new URL("https://jenkins.dev.webserver.insulet.com/active-choice/aws-region.php?awsenv=" + ENVIRONMENT).getText() 
+                    def retList = new JsonSlurper().parseText(data) // Since retList contains only one value, assign it to the global awsRegion variable 
+                    def awsRegion = retList[0]
+
+                    sh """
+                    echo "Cluster ${clusterName} =========  ${env.CLUSTER_NAME}" 
+                    echo "Restarting ECS service..."    
+                          aws ecs update-service --profile ${awsProfile} --region ${awsRegion} --cluster ${clusterName} --service ${serviceName} --force-new-deployment
+                    echo "ECS service has been restarted."                    
+                    """
+                }
+            }
+        }
+    }
+}
