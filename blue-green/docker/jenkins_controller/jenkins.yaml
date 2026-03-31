@@ -1,0 +1,80 @@
+jenkins:
+  systemMessage: Jenkins configured automatically
+  numExecutors: 0
+  slaveAgentPort: 50000
+  # WEBSERVER: global env for jobs (e.g. jenkins.dev.insulet.com). Set jenkins_webserver_hostname in tfvars.
+
+  globalNodeProperties:
+    - envVars:
+        env:
+          - key: "WEBSERVER"
+            value: "jenkins.prod.insulet.com"
+
+  # Local auth for now (no Azure AD). Switch back to azureAdMatrix + securityRealm.azure when ready.
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+  remotingSecurity:
+    enabled: true
+  securityRealm:
+    local:
+      allowsSignup: true
+      users:
+        - id: "admin"
+          password: "JenkinsDev123!"
+  clouds:
+    - ecs:
+        credentialsId: false
+        allowedOverrides: "inheritFrom,label"
+        cluster: arn:aws:ecs:us-east-2:114039064573:cluster/jenkins-blue-green-prod-agents
+        name: jenkins-agent
+        regionName: us-east-2
+        jenkinsUrl: http://jenkins-blue-green-prod.jenkins-blue-green-prod-controller.dns:8080
+        tunnel: jenkins-blue-green-prod.jenkins-blue-green-prod-controller.dns:50000
+        templates:
+          - assignPublicIp: true
+            cpu: 512
+            memoryReservation: 1024
+            image: 114039064573.dkr.ecr.us-east-2.amazonaws.com/jenkins-blue-green-prod-agent
+            label: jenkins-agent
+            launchType: FARGATE
+            networkMode: awsvpc
+            logDriver: awslogs
+            logDriverOptions:
+              - name: awslogs-group
+                value: /ecs/jenkins-blue-green-prod
+              - name: awslogs-region
+                value: us-east-2
+              - name: awslogs-stream-prefix
+                value: jenkins-blue-green-prod-agent
+            securityGroups: sg-06ba00ad7b87f8858
+            subnets: subnet-06e158d9e205a9588,subnet-04e35976121efcd63,subnet-06ea6dd1d4590f251
+            templateName: jenkins-agent
+            executionRole: arn:aws:iam::114039064573:role/jenkins-blue-green-prod-execution-role
+            taskRole: arn:aws:iam::114039064573:role/jenkins-blue-green-prod-execution-role
+            efsMountPoints:
+              - containerPath: /var/jenkins_home
+                name: jenkins-blue-green-prod-efs
+                transitEncryption: true
+                fileSystemId: fs-0c55aad40d6c82803
+                accessPointId: fsap-06b05e59c437d0129
+                iam: true
+  
+  nodes:
+    - permanent:
+        name: "persistent-agent"
+        remoteFS: "/home/jenkins/agent"
+        launcher:
+          inbound:
+            workDirSettings:
+              disabled: false
+              workDirPath: "/home/jenkins/agent"
+              failIfWorkDirIsMissing: false
+        labelString: "jenkins-agent"
+        numExecutors: 1
+        mode: NORMAL
+        nodeProperties:
+          - envVars:
+              env:
+                - key: "JENKINS_URL"
+                  value: "http://jenkins-blue-green-prod.jenkins-blue-green-prod-controller.dns:8080"                

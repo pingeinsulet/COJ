@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Destroy this environment but preserve EFS (plugins, config) and ECR (images). Run from this directory: ./destroy
+set -euo pipefail
+ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV="$(basename "$ENV_DIR")"
+REPO_ROOT="$(cd "$ENV_DIR/../.." && pwd)"
+
+echo "=== Destroy $ENV (preserving EFS and ECR) ==="
+cd "$REPO_ROOT"
+./scripts/destroy-preserve-efs-ecr.sh "$ENV"
+echo "Done. To bring back: cd $ENV_DIR && ./build (and run imports if the script printed them)."

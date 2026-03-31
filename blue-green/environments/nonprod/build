@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Build this environment: Terraform apply + build and push images. Run from this directory: ./build
+set -euo pipefail
+ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV="$(basename "$ENV_DIR")"
+REPO_ROOT="$(cd "$ENV_DIR/../.." && pwd)"
+TFVARS="$ENV.tfvars"
+
+echo "=== Build $ENV ==="
+cd "$ENV_DIR"
+terraform init -input=false
+terraform apply -var-file="$TFVARS" -auto-approve
+
+cd "$REPO_ROOT"
+./scripts/build-controller.sh "$ENV"
+./scripts/build-persistent-agent.sh "$ENV"
+./scripts/build-ecs-agents.sh "$ENV"
+
+echo "Done. Ready to deploy: run ./deploy from $ENV_DIR"

@@ -1,0 +1,165 @@
+// Promotion pipeline: dev → nonprod → prod with manual gates.
+// Run from repo root (blue-green/ or repo root). Requires: Docker, AWS CLI, Terraform, jq on the agent.
+// AWS credentials must be configured for the account that holds dev/nonprod/prod (or use role/credentials binding per env).
+
+pipeline {
+  agent { label 'jenkins-agent' }
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '21'))
+    disableConcurrentBuilds()
+    timeout(time: 120, unit: 'MINUTES')
+  }
+  parameters {
+    choice(
+      name: 'PROMOTE_TO',
+      choices: ['dev', 'nonprod', 'prod', 'all'],
+      description: 'Deploy up to this environment. "all" = dev then nonprod then prod (with gates).'
+    )
+    string(
+      name: 'GIT_REF',
+      defaultValue: 'main',
+      description: 'Branch or commit to build (e.g. main, develop, or SHA).'
+    )
+    booleanParam(
+      name: 'DEPLOY_AGENT',
+      defaultValue: false,
+      description: 'Also build and deploy the persistent agent in each environment.'
+    )
+  }
+  environment {
+    // Workspace must be the repo root that contains blue-green/ (or the blue-green dir itself)
+    REPO_ROOT = "${WORKSPACE}"
+  }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short ${params.GIT_REF}", returnStdout: true).trim()
+        }
+      }
+    }
+
+    stage('Dev: Build & Deploy') {
+      when { expression { params.PROMOTE_TO in ['dev', 'nonprod', 'prod', 'all'] } }
+      steps {
+        dir("${env.REPO_ROOT}") {
+          script {
+            echo "Building and deploying controller to dev (${env.GIT_COMMIT_SHORT})..."
+          }
+          // Dev: in-repo scripts (CodeDeploy blue/green when controller_blue_green = true)
+          sh '''
+            if [ -d blue-green/scripts ]; then
+              blue-green/scripts/dev/build-and-push-controller.sh
+              blue-green/scripts/dev/deploy-controller-blue-green.sh
+            else
+              ./scripts/dev/build-and-push-controller.sh
+              ./scripts/dev/deploy-controller-blue-green.sh
+            fi
+          '''
+          script {
+            if (params.DEPLOY_AGENT) {
+              sh '''
+                if [ -d blue-green/scripts ]; then
+                  blue-green/scripts/dev/build-and-push-agent.sh
+                  blue-green/scripts/dev/activate-persistent-agent.sh
+                else
+                  ./scripts/dev/build-and-push-agent.sh
+                  ./scripts/dev/activate-persistent-agent.sh
+                fi
+              '''
+            }
+          }
+        }
+      }
+    }
+
+    stage('Promote to Nonprod?') {
+      when { expression { params.PROMOTE_TO in ['nonprod', 'prod', 'all'] } }
+      steps {
+        input message: 'Promote to Nonprod?', ok: 'Promote to Nonprod'
+      }
+    }
+
+    stage('Nonprod: Build & Deploy') {
+      when { expression { params.PROMOTE_TO in ['nonprod', 'prod', 'all'] } }
+      steps {
+        dir("${env.REPO_ROOT}") {
+          script {
+            echo "Building and deploying controller to nonprod (same ref: ${env.GIT_COMMIT_SHORT})..."
+          }
+          sh '''
+            if [ -d blue-green/scripts ]; then
+              blue-green/scripts/build-controller.sh nonprod
+              blue-green/scripts/nonprod/deploy-controller-blue-green.sh
+            else
+              ./scripts/build-controller.sh nonprod
+              ./scripts/nonprod/deploy-controller-blue-green.sh
+            fi
+          '''
+          script {
+            if (params.DEPLOY_AGENT) {
+              sh '''
+                if [ -d blue-green/scripts ]; then
+                  blue-green/scripts/build-persistent-agent.sh nonprod
+                  blue-green/scripts/nonprod/activate-persistent-agent.sh
+                else
+                  ./scripts/build-persistent-agent.sh nonprod
+                  ./scripts/nonprod/activate-persistent-agent.sh
+                fi
+              '''
+            }
+          }
+        }
+      }
+    }
+
+    stage('Promote to Prod?') {
+      when { expression { params.PROMOTE_TO in ['prod', 'all'] } }
+      steps {
+        input message: 'Promote to Production?', ok: 'Promote to Prod'
+      }
+    }
+
+    stage('Prod: Build & Deploy') {
+      when { expression { params.PROMOTE_TO in ['prod', 'all'] } }
+      steps {
+        dir("${env.REPO_ROOT}") {
+          script {
+            echo "Building and deploying controller to prod (same ref: ${env.GIT_COMMIT_SHORT})..."
+          }
+          sh '''
+            if [ -d blue-green/scripts ]; then
+              blue-green/scripts/build-controller.sh prod
+              blue-green/scripts/prod/deploy-controller-blue-green.sh
+            else
+              ./scripts/build-controller.sh prod
+              ./scripts/prod/deploy-controller-blue-green.sh
+            fi
+          '''
+          script {
+            if (params.DEPLOY_AGENT) {
+              sh '''
+                if [ -d blue-green/scripts ]; then
+                  blue-green/scripts/build-persistent-agent.sh prod
+                  blue-green/scripts/prod/activate-persistent-agent.sh
+                else
+                  ./scripts/build-persistent-agent.sh prod
+                  ./scripts/prod/activate-persistent-agent.sh
+                fi
+              '''
+            }
+          }
+        }
+      }
+    }
+  }
+  post {
+    failure {
+      echo "Promotion failed. Check logs and re-run from the failed stage if needed."
+    }
+    success {
+      echo "Promotion completed up to ${params.PROMOTE_TO}."
+    }
+  }
+}

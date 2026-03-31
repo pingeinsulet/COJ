@@ -1,0 +1,7 @@
+# One plugin per line. No version = latest at build time. Build may fail if a plugin is incompatible; that is acceptable.
+amazon-ecs
+configuration-as-code
+workflow-aggregator
+job-dsl
+azure-ad
+thinBackup

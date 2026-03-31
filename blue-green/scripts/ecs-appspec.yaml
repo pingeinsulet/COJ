@@ -1,0 +1,12 @@
+# Reference appspec for ECS blue/green. scripts/dev/deploy-controller-blue-green.sh
+# generates the actual appspec with the correct container name and port.
+# TaskDefinition is replaced by "aws ecs deploy" with the new task definition ARN.
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: "PLACEHOLDER"
+        LoadBalancerInfo:
+          ContainerName: "jenkins-blue-green-dev"
+          ContainerPort: 8080

@@ -1,0 +1,80 @@
+jenkins:
+  systemMessage: Jenkins configured automatically
+  numExecutors: 0
+  slaveAgentPort: ${jenkins_agent_port}
+  # WEBSERVER: global env for jobs (e.g. jenkins.dev.insulet.com). Set jenkins_webserver_hostname in tfvars.
+%{if jenkins_webserver_hostname != ""}
+  globalNodeProperties:
+    - envVars:
+        env:
+          - key: "WEBSERVER"
+            value: "${jenkins_webserver_hostname}"
+%{endif}
+  # Local auth for now (no Azure AD). Switch back to azureAdMatrix + securityRealm.azure when ready.
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+  remotingSecurity:
+    enabled: true
+  securityRealm:
+    local:
+      allowsSignup: true
+      users:
+        - id: "admin"
+          password: "JenkinsDev123!"
+  clouds:
+    - ecs:
+        credentialsId: false
+        allowedOverrides: "inheritFrom,label"
+        cluster: ${ecs_agent_cluster}
+        name: jenkins-agent
+        regionName: ${region}
+        jenkinsUrl: http://${jenkins_dns}:${jenkins_controller_port}
+        tunnel: ${jenkins_dns}:${jenkins_agent_port}
+        templates:
+          - assignPublicIp: true
+            cpu: 512
+            memoryReservation: 1024
+            image: ${jenkins_agent_image}
+            label: jenkins-agent
+            launchType: FARGATE
+            networkMode: awsvpc
+            logDriver: awslogs
+            logDriverOptions:
+              - name: awslogs-group
+                value: ${log_group}
+              - name: awslogs-region
+                value: ${region}
+              - name: awslogs-stream-prefix
+                value: ${log_stream}
+            securityGroups: ${jenkins_agent_sg}
+            subnets: ${subnets}
+            templateName: jenkins-agent
+            executionRole: ${ecs_execution_role}
+            taskRole: ${ecs_execution_role}
+            efsMountPoints:
+              - containerPath: ${containerPath}
+                name: ${efsVolumeName}
+                transitEncryption: true
+                fileSystemId: ${efsVolumeId}
+                accessPointId: ${accessPointId}
+                iam: true
+  
+  nodes:
+    - permanent:
+        name: "persistent-agent"
+        remoteFS: "/home/jenkins/agent"
+        launcher:
+          inbound:
+            workDirSettings:
+              disabled: false
+              workDirPath: "/home/jenkins/agent"
+              failIfWorkDirIsMissing: false
+        labelString: "jenkins-agent"
+        numExecutors: 1
+        mode: NORMAL
+        nodeProperties:
+          - envVars:
+              env:
+                - key: "JENKINS_URL"
+                  value: "http://${jenkins_dns}:${jenkins_controller_port}"                

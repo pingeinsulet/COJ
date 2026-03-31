@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Force ECS to deploy the current persistent agent :latest image. Run from repo root.
+set -euo pipefail
+
+CLUSTER="jenkins-blue-green-prod-agents"
+SERVICE="jenkins-blue-green-prod-persistent-agent"
+REGION="us-east-2"
+
+if ! command -v aws &>/dev/null; then
+  echo "Error: aws CLI is required." >&2
+  exit 1
+fi
+
+echo "Forcing new deployment of $SERVICE on cluster $CLUSTER..."
+aws ecs update-service \
+  --cluster "$CLUSTER" \
+  --service "$SERVICE" \
+  --force-new-deployment \
+  --region "$REGION" \
+  --output text
+
+echo "Deployment started."

@@ -1,0 +1,50 @@
+[
+   {
+      "name": "${name}",
+      "image": "${image}:latest",
+      "cpu": ${cpu},
+      "memory": ${memory},
+      "essential": true,
+      "portMappings": [
+         {
+            "containerPort": ${jenkins_controller_port},
+            "hostPort": ${jenkins_controller_port}
+         },
+         {
+            "containerPort": ${jenkins_agent_port},
+            "hostPort": ${jenkins_agent_port}
+         }
+      ],
+      "mountPoints": [{
+         "containerPath": "${containerPath}",
+         "sourceVolume": "${efsVolumeName}"
+      }],
+      "volumes": [{
+         "name": "${efsVolumeName}",
+         "efsVolumeConfiguration": {
+            "fileSystemId": "${efsVolumeId}",
+            "transmitEncryption": ${transmitEncryption}
+         }
+      }],
+      "logConfiguration": {
+         "logDriver": "awslogs",
+         "options": {
+            "awslogs-group": "${log_group}",
+            "awslogs-region": "${region}",
+            "awslogs-stream-prefix": "${log_stream}"
+         }
+      },
+      "environment": [{
+         "name": "JAVA_OPTS",
+         "value": "-Djenkins.install.runSetupWizard=false -Djavax.net.ssl.trustStore=/var/jenkins_home/etc/ssl/cacerts"
+      }],
+      "stopTimeout": 120,
+      "healthCheck": {
+         "command": ["CMD-SHELL", "curl -f -s http://127.0.0.1:${jenkins_controller_port}/login || exit 1"],
+         "interval": 30,
+         "timeout": 5,
+         "retries": 3,
+         "startPeriod": 300
+      }
+   }
+]

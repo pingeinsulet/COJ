@@ -1,0 +1,16 @@
+# Copy to prod.tfvars and fill in your values. Do not commit prod.tfvars if it contains secrets.
+# Change aws_account_id to deploy to a different account; then update vpc_id, subnets, etc.
+# aws_account_id             = "123456789012"
+
+aws_region                 = "us-east-2"
+prefix                     = "jenkins-blue-green-prod"
+vpc_id                     = "vpc-xxxxxxxxx"
+private_subnets            = ["subnet-xxx", "subnet-yyy", "subnet-zzz"]
+public_subnets             = ["subnet-aaa", "subnet-bbb", "subnet-ccc"]
+jenkins_controller_cpu     = "4096"
+jenkins_controller_mem    = "8192"
+alb_acm_certificate_arn    = "arn:aws:acm:us-east-2:ACCOUNT:certificate/xxx"
+route53_zone_id            = "Zxxxxxxxx"
+route53_alias_name         = "jenkins.prod"
+jenkins_agent_secret_name  = "jenkins/persistent-agent/secret-prod"
+jenkins_webserver_hostname = "jenkins.prod.insulet.com"

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Deploy this environment (controller + persistent agent). Run from this directory: ./deploy
+set -euo pipefail
+ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$ENV_DIR/../.." && pwd)"
+
+echo "=== Deploy nonprod ==="
+cd "$REPO_ROOT"
+./scripts/nonprod/deploy-controller-blue-green.sh
+./scripts/nonprod/activate-persistent-agent.sh
+echo "Done."

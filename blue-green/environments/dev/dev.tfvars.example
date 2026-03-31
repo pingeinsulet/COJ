@@ -1,0 +1,15 @@
+# Copy to dev.tfvars and fill in your values. Do not commit dev.tfvars if it contains secrets.
+
+aws_region              = "us-east-2"
+prefix                  = "jenkins-blue-green-dev"
+vpc_id                  = "vpc-xxxxxxxxx"
+private_subnets         = ["subnet-xxx", "subnet-yyy", "subnet-zzz"]
+public_subnets          = ["subnet-aaa", "subnet-bbb", "subnet-ccc"]
+jenkins_controller_cpu  = "2048"
+jenkins_controller_mem  = "4096"
+alb_acm_certificate_arn = "arn:aws:acm:us-east-2:ACCOUNT:certificate/xxx"
+route53_zone_id         = "Zxxxxxxxx"
+route53_alias_name      = "jenkins.dev"
+jenkins_agent_secret_name = "jenkins/persistent-agent/secret-dev"
+# Safety: uncomment and set to your AWS account ID to block deploy in wrong account
+# expected_aws_account_id   = "123456789012"
